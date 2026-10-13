@@ -4,6 +4,7 @@ mod crypto;
 mod files;
 mod identity;
 mod message;
+mod platform;
 mod router;
 mod transfer;
 mod transport;
@@ -45,10 +46,12 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Symmetric peer: advertise and scan, synchronizing with other peers (headless).
+    /// Symmetric peer; automatically uses scan-only mode on Windows adapters without BLE peripheral support.
     Peer(PeerOptions),
-    /// System tray peer: left-click the icon to pause/resume all clipboard sharing.
+    /// Tray peer; auto-detects supported Bluetooth roles (left-click to pause/resume).
     Tray(PeerOptions),
+    /// Report Bluetooth LE radio role capabilities (especially on Windows).
+    Diagnose,
     /// Compatibility shortcut for peer --no-scan (protocol v3; no v2 interop).
     Serve {
         #[arg(long)]
@@ -166,7 +169,7 @@ pub(crate) async fn run_peer(
         no_images,
         receive_dir,
     } = config;
-    let advertise = !no_advertise;
+    let mut advertise = !no_advertise;
     let scan = !no_scan;
     let allow_images = !no_images;
     if !(1..=32).contains(&max_inbound) || !(1..=32).contains(&max_outbound) {
@@ -174,6 +177,35 @@ pub(crate) async fn run_peer(
     }
     if !advertise && !scan {
         bail!("peer needs at least one BLE role");
+    }
+    // Windows can scan/connect even when a GATT peripheral cannot advertise.
+    // Check the actual adapter rather than repeatedly invoking unsupported APIs.
+    if advertise {
+        match platform::capabilities().await {
+            Ok(capability) => {
+                let (selected_advertise, _) = platform::select_roles(advertise, scan, capability)?;
+                if !selected_advertise {
+                    eprintln!(
+                        "BLEClip: this Bluetooth adapter cannot advertise a connectable BLE GATT service (HRESULT 0x8007013C). \n                         Continuing in central-only mode; clipboard sharing stays bidirectional. \n                         Another BLEClip peer must advertise (for example, Linux)."
+                    );
+                }
+                advertise = selected_advertise;
+            }
+            Err(err) => {
+                // If the capability API is unavailable, prefer the working
+                // central/client mode when it is allowed.
+                if scan {
+                    eprintln!(
+                        "BLEClip: cannot query Bluetooth peripheral support ({err:#}). \n                         Using central-only mode to avoid unsupported advertising; \n                         run 'bleclip diagnose' for details."
+                    );
+                    advertise = false;
+                } else {
+                    eprintln!(
+                        "BLEClip: cannot query Bluetooth peripheral support ({err:#}); \n                         attempting peripheral-only mode."
+                    );
+                }
+            }
+        }
     }
     let psk = read_key(&key_file)?;
     let id_path = match identity_file {
@@ -188,7 +220,10 @@ pub(crate) async fn run_peer(
         Some(path) => path,
         None => default_receive_dir()?,
     };
-    println!("BLEClip v3, node {own_id}, encrypted mesh enabled. Press Ctrl+C to quit.");
+    println!(
+        "BLEClip {}, node {own_id}, encrypted mesh enabled. Press Ctrl+C to quit.",
+        env!("CARGO_PKG_VERSION")
+    );
     println!(
         "Images: {allow_images}; files: {allow_files}; incoming files: {}",
         receive_dir.display()
@@ -211,6 +246,13 @@ pub(crate) async fn run_peer(
                 )
                 .await
                 {
+                    let details = format!("{error:#}");
+                    if platform::is_unsupported_peripheral_error(&details) {
+                        eprintln!(
+                            "BLEClip: GATT advertising unsupported (HRESULT 0x8007013C). \n                             Disabling peripheral advertising; central scanning remains active. \n                             Connect to another BLEClip peer advertising its service."
+                        );
+                        break;
+                    }
                     eprintln!("BLE advertising unavailable: {error:#}; retrying");
                 }
                 sleep(Duration::from_secs(8)).await;
@@ -311,6 +353,25 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Keygen { output } => create_key(&output),
+        Command::Diagnose => {
+            match platform::capabilities().await {
+                Ok(Some(info)) => {
+                    println!("Windows BLE adapter capabilities:");
+                    println!("  LE supported: {}", info.low_energy);
+                    println!("  Central/client role supported: {}", info.central);
+                    println!("  Peripheral/GATT server role supported: {}", info.peripheral);
+                    if !info.peripheral {
+                        println!("Windows cannot host connectable GATT services with this adapter (possible 0x8007013C).");
+                        println!("BLEClip peer and tray will scan/connect automatically, but need another advertising peer.");
+                    }
+                }
+                Ok(None) => println!(
+                    "Non-Windows adapter: peripheral capabilities are driver-dependent. \n                     BLEClip uses BlueZ and tries both advertising and scanning."
+                ),
+                Err(err) => eprintln!("Unable to query Bluetooth capabilities: {err:#}"),
+            }
+            Ok(())
+        }
         Command::Peer(options) => run_peer(options, None).await,
         Command::Tray(options) => tray::run(options),
         Command::Serve {

@@ -15,3 +15,12 @@ Please report issues privately through GitHub's private vulnerability reporting 
 ## System tray pause semantics
 
 The tray toggle stops BLE peer tasks and closes in-memory pending transfer queues when paused. It does not erase a clipboard item already received, delete a saved file, or revoke another device's previously copied content. Once sharing resumes, clipboard monitoring starts from the then-current clipboard contents and sends subsequent changes only. A UI icon indicates the user's sharing preference, not verified successful BLE connectivity.
+
+
+## Windows peripheral mode fallback
+
+When Windows cannot host a connectable GATT server, BLEClip disables only
+the unsupported advertising role and continues scanning for advertising
+peers. This does not change the authentication or cryptographic requirements
+and does not enable LAN or internet transport. At least one device must
+advertise for the BLE link to form.

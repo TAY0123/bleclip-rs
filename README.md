@@ -1,4 +1,4 @@
-# BLEClip v0.4 — encrypted P2P clipboard mesh with a system tray
+# BLEClip v0.4.1 — encrypted P2P clipboard mesh with a system tray
 
 BLEClip is a **serverless Bluetooth Low Energy** Rust app (CLI or system tray) that automatically synchronizes **text, clipboard images, and copied files** between multiple trusted Windows/Linux computers. Each node advertises, scans, and can relay an update to other online nodes. BLE advertisements are for discovery only; actual content travels over mutually authenticated and encrypted BLE GATT connections.
 
@@ -86,21 +86,42 @@ The archive also includes `bleclip.exe` for CLI usage (including key generation)
 
 The tray controls access to the clipboard transfer subsystem, **not OS-wide Bluetooth**; it does not disable your Bluetooth adapter or other Bluetooth applications.
 
-### Bluetooth fallback roles
+### Windows BLE peripheral-role fallback (HRESULT 0x8007013C)
 
-All peers normally advertise and scan. If a Windows Bluetooth dongle cannot act as a peripheral:
+Some Bluetooth adapters support the Windows BLE **central/client** role but not
+the connectable **peripheral/GATT server** role. This produces HRESULT
+`0x8007013C` ("The device does not support the command feature") during
+GATT advertising. The Windows `BluetoothAdapter.IsPeripheralRoleSupported` API
+reports this separately from central support.
 
-```bash
-bleclip peer --key-file bleclip.key --sync-files --no-advertise
+BLEClip v0.4.1 checks the Windows Bluetooth adapter when starting `peer` or
+`tray`, including the double-click tray launcher. When peripheral
+support is unavailable, it **automatically disables advertising** while still
+scanning/connecting as central. Once connected to a GATT server, clipboard
+data can travel in **both directions**.
+
+```powershell
+.\\bleclip.exe diagnose
+.\\bleclip.exe peer --key-file .\\bleclip.key
+# Optional explicit central-only workaround:
+.\\bleclip.exe peer --key-file .\\bleclip.key --no-advertise --sync-files
 ```
 
-A Linux PC with advertising support can act as an encrypted relay without being an application-level server:
+- `bleclip diagnose` reports the Windows adapter's LE, Central, and
+  Peripheral-role support. It does not require a clipboard key.
+- A Linux peer with BLE GATT advertising support can serve as the peripheral.
+- If **both Windows devices cannot advertise**, two such machines cannot
+  directly connect to each other with GATT-only BLEClip. Use an
+  advertising-capable peer/adapter or a different transport.
+- The peripheral-only `serve` command returns an actionable error
+  rather than looping if Windows reports the peripheral role unsupported.
+- If an adapter claims support but GATT advertising still fails with the
+  same HRESULT, BLEClip stops advertising retries while the central
+  scanner remains active.
+- This fallback does **not** change the shared-key authentication, encryption,
+  or the directions in which clipboard text, images, and files synchronize.
 
-```bash
-bleclip peer --key-file bleclip.key --sync-files --no-scan
-```
-
-BLE central/peripheral are necessary radio roles, **not an internet/cloud service**. A Wi-Fi, LAN, or internet connection is never used for content.
+BLE central/peripheral are radio connection roles, not cloud-server roles.
 
 ### Build prerequisites
 
