@@ -1,9 +1,13 @@
 [package]
 name = "bleclip"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 description = "Serverless multi-peer encrypted text, image, and file clipboard sync over BLE on Windows and Linux"
+
+[features]
+# GUI-subsystem build for the Windows tray launcher (no console window).
+tray-gui = []
 
 [dependencies]
 anyhow = "1"
@@ -26,3 +30,12 @@ zeroize = "1.8"
 [profile.release]
 lto = "thin"
 strip = true
+
+# The Linux KSNI backend supports KDE Plasma/Wayland without GTK libraries.
+[target.'cfg(target_os = "linux")'.dependencies]
+tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
+
+# The native Win32 tray uses a message pump (no GTK or Tauri dependency).
+[target.'cfg(windows)'.dependencies]
+tray-icon = { version = "0.26.1", default-features = false }
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }

@@ -11,3 +11,7 @@
 - Do not put `bleclip.key` in a public repository. It is excluded by `.gitignore`; `keygen` refuses to overwrite existing keys.
 
 Please report issues privately through GitHub's private vulnerability reporting if enabled.
+
+## System tray pause semantics
+
+The tray toggle stops BLE peer tasks and closes in-memory pending transfer queues when paused. It does not erase a clipboard item already received, delete a saved file, or revoke another device's previously copied content. Once sharing resumes, clipboard monitoring starts from the then-current clipboard contents and sends subsequent changes only. A UI icon indicates the user's sharing preference, not verified successful BLE connectivity.

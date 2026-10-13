@@ -1,8 +1,8 @@
-# BLEClip v0.3 — encrypted P2P clipboard mesh for Windows and Linux
+# BLEClip v0.4 — encrypted P2P clipboard mesh with a system tray
 
-BLEClip is a **serverless Bluetooth Low Energy** Rust CLI that automatically synchronizes **text, clipboard images, and copied files** between multiple trusted Windows/Linux computers. Each node advertises, scans, and can relay an update to other online nodes. BLE advertisements are for discovery only; actual content travels over mutually authenticated and encrypted BLE GATT connections.
+BLEClip is a **serverless Bluetooth Low Energy** Rust app (CLI or system tray) that automatically synchronizes **text, clipboard images, and copied files** between multiple trusted Windows/Linux computers. Each node advertises, scans, and can relay an update to other online nodes. BLE advertisements are for discovery only; actual content travels over mutually authenticated and encrypted BLE GATT connections.
 
-> **Experimental / hardware testing needed.** This revision extends an experimental v0.2 implementation. A successful `cargo test` / `cargo build` does not prove the Bluetooth hardware, Windows GATT peripheral mode, or desktop clipboard integration works. See [SECURITY.md](SECURITY.md).
+> **Experimental / hardware testing needed.** The system tray feature does not replace device-level BLE validation. A successful `cargo test` / `cargo build` does not prove the Bluetooth hardware, Windows GATT peripheral mode, or desktop clipboard integration works. See [SECURITY.md](SECURITY.md).
 
 ## Features and hard limits
 
@@ -59,6 +59,32 @@ Windows PowerShell:
 **Use the desktop clipboard:** copy some text, copy a screenshot/image, or select files in Explorer or your Linux file manager and press Ctrl+C. Each reachable peer receives the new item. Images are put directly on the target clipboard. Copied files are stored inside `Downloads/BLEClip/<transfer UUID>/` (or the selected receive directory), and their new local paths are put on the clipboard so Ctrl+V can paste them into a file manager that supports file-list clipboard formats. Clipboard file-list support depends on the source application and desktop session.
 
 BLEClip only sends clipboard changes after startup. It is not a standalone file-copy dialog and does not implement drag-and-drop. If a copied file is larger than the limit, the item is skipped with an error.
+
+### System tray (Windows + Linux)
+
+Use the **tray** command on each computer for a persistent system tray / notification area icon:
+
+```bash
+bleclip tray --key-file bleclip.key --sync-files
+```
+
+- **Left click** the tray icon to pause/resume clipboard sharing. **Green** = enabled; **gray with slash** = paused.
+- **Right click** for **Pause sharing / Resume sharing** and **Quit BLEClip**.
+- Pausing cancels advertising, scanning and active encrypted BLE connections, dropping queued/in-flight clipboard transfers. Resuming reinitializes BLE, reconnects peers, and starts monitoring again. Content already on the clipboard is not uploaded on resume; only subsequent changes are sent.
+- Text and image sync use the same settings as regular peer mode; use `--sync-files` to opt in to file transfer, `--no-images` to disable images, and `--no-advertise` when a device cannot offer the peripheral role.
+- The headless `bleclip peer` command remains supported for unattended terminals/services.
+
+**Windows:** Download the public Windows ZIP and use `bleclip-tray.exe` for a GUI-subsystem launcher without a console window. Generate or securely copy `bleclip.key` **into the same directory as `bleclip-tray.exe`**, then double-click the launcher. The launcher defaults to text/image sync and accepts normal CLI parameters when invoked with arguments, for example:
+
+```powershell
+.\bleclip-tray.exe tray --key-file .\bleclip.key --sync-files
+```
+
+The archive also includes `bleclip.exe` for CLI usage (including key generation).
+
+**Linux (KDE Plasma / Wayland or X11):** Run `bleclip tray --key-file /absolute/path/bleclip.key` from your graphical login session, or create a desktop-session autostart entry using that command with **Terminal=false**. The Linux backend uses D-Bus StatusNotifierItem (`ksni`), not GTK, so KDE Plasma works natively. Other desktop environments may require an extension or a visible StatusNotifierItem host; running without a graphical login session will not show an icon.
+
+The tray controls access to the clipboard transfer subsystem, **not OS-wide Bluetooth**; it does not disable your Bluetooth adapter or other Bluetooth applications.
 
 ### Bluetooth fallback roles
 
