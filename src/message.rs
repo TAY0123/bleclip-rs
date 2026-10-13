@@ -1,0 +1,166 @@
+//! Version 3 encrypted application protocol. Binary content is transferred in
+//! bounded chunks; per-hop integrity covers the *entire* original byte stream.
+use anyhow::{bail, ensure, Result};
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use uuid::Uuid;
+
+pub const MAX_HOPS: u8 = 8;
+pub const MAX_TEXT: usize = 16 * 1024;
+pub const MAX_PNG: usize = 4 * 1024 * 1024;
+pub const MAX_FILES: usize = 8 * 1024 * 1024;
+pub const CHUNK_SIZE: usize = 1024;
+const IDENTITY: u8 = 0x10;
+const START: u8 = 0x20;
+const CHUNK: u8 = 0x21;
+const END: u8 = 0x22;
+const ACK: u8 = 0x23;
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Kind {
+    Text = 1,
+    Png = 2,
+    Files = 3,
+}
+impl Kind {
+    pub fn from_byte(byte: u8) -> Result<Self> {
+        match byte { 1 => Ok(Self::Text), 2 => Ok(Self::Png), 3 => Ok(Self::Files), _ => bail!("unknown payload type") }
+    }
+    pub fn limit(self) -> usize {
+        match self { Self::Text => MAX_TEXT, Self::Png => MAX_PNG, Self::Files => MAX_FILES }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Update {
+    pub id: Uuid,
+    pub origin: Uuid,
+    pub hops: u8,
+    pub kind: Kind,
+    pub bytes: Arc<[u8]>,
+}
+impl Update {
+    pub fn new(origin: Uuid, kind: Kind, bytes: Vec<u8>) -> Result<Self> {
+        let update = Self { id: Uuid::new_v4(), origin, hops: MAX_HOPS, kind, bytes: bytes.into() };
+        update.validate()?;
+        Ok(update)
+    }
+    pub fn text(origin: Uuid, text: String) -> Result<Self> {
+        Self::new(origin, Kind::Text, text.into_bytes())
+    }
+    pub fn validate(&self) -> Result<()> {
+        ensure!(!self.id.is_nil() && !self.origin.is_nil(), "nil update identifier");
+        ensure!(self.hops <= MAX_HOPS, "invalid remaining hops");
+        ensure!(self.bytes.len() <= self.kind.limit(), "payload exceeds type limit");
+        if self.kind == Kind::Text { std::str::from_utf8(&self.bytes)?; }
+        Ok(())
+    }
+    pub fn digest(&self) -> [u8; 32] { Sha256::digest(&self.bytes).into() }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Header {
+    pub id: Uuid,
+    pub origin: Uuid,
+    pub hops: u8,
+    pub kind: Kind,
+    pub size: u32,
+    pub sha256: [u8; 32],
+}
+impl Header {
+    pub fn for_update(update: &Update) -> Self {
+        Self { id: update.id, origin: update.origin, hops: update.hops,
+            kind: update.kind, size: update.bytes.len() as u32, sha256: update.digest() }
+    }
+    pub fn validate(&self) -> Result<()> {
+        ensure!(!self.id.is_nil() && !self.origin.is_nil(), "nil update identifier");
+        ensure!(self.hops <= MAX_HOPS && self.size as usize <= self.kind.limit(), "invalid payload size/hops");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Message {
+    Identity(Uuid),
+    Start(Header),
+    Chunk { id: Uuid, offset: u32, bytes: Vec<u8> },
+    End(Uuid),
+    Ack(Uuid),
+}
+impl Message {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        match self {
+            Self::Identity(id) => { ensure!(!id.is_nil(), "nil node identity"); out.push(IDENTITY); out.extend_from_slice(id.as_bytes()); }
+            Self::Start(h) => {
+                h.validate()?;
+                out.push(START);
+                out.extend_from_slice(h.id.as_bytes());
+                out.extend_from_slice(h.origin.as_bytes());
+                out.push(h.hops);
+                out.push(h.kind as u8);
+                out.extend_from_slice(&h.size.to_be_bytes());
+                out.extend_from_slice(&h.sha256);
+            }
+            Self::Chunk { id, offset, bytes } => {
+                ensure!(!id.is_nil() && !bytes.is_empty() && bytes.len() <= CHUNK_SIZE, "invalid transfer chunk");
+                out.push(CHUNK);
+                out.extend_from_slice(id.as_bytes());
+                out.extend_from_slice(&offset.to_be_bytes());
+                out.extend_from_slice(bytes);
+            }
+            Self::End(id) => { ensure!(!id.is_nil(), "nil end id"); out.push(END); out.extend_from_slice(id.as_bytes()); }
+            Self::Ack(id) => { ensure!(!id.is_nil(), "nil ack id"); out.push(ACK); out.extend_from_slice(id.as_bytes()); }
+        }
+        Ok(out)
+    }
+    pub fn decode(b: &[u8]) -> Result<Self> {
+        match b.first().copied() {
+            Some(IDENTITY) if b.len() == 17 => {
+                let id = Uuid::from_slice(&b[1..17])?;
+                ensure!(!id.is_nil(), "nil node identity");
+                Ok(Self::Identity(id))
+            }
+            Some(START) if b.len() == 1 + 16 + 16 + 1 + 1 + 4 + 32 => {
+                let h = Header { id: Uuid::from_slice(&b[1..17])?,
+                    origin: Uuid::from_slice(&b[17..33])?, hops: b[33],
+                    kind: Kind::from_byte(b[34])?, size: u32::from_be_bytes(b[35..39].try_into()?),
+                    sha256: b[39..71].try_into()? };
+                h.validate()?;
+                Ok(Self::Start(h))
+            }
+            Some(CHUNK) if b.len() > 21 && b.len() <= 21 + CHUNK_SIZE => {
+                let id = Uuid::from_slice(&b[1..17])?;
+                ensure!(!id.is_nil(), "nil chunk id");
+                Ok(Self::Chunk { id, offset: u32::from_be_bytes(b[17..21].try_into()?), bytes: b[21..].to_vec() })
+            }
+            Some(END) if b.len() == 17 => Ok(Self::End(Uuid::from_slice(&b[1..17])?)),
+            Some(ACK) if b.len() == 17 => Ok(Self::Ack(Uuid::from_slice(&b[1..17])?)),
+            _ => bail!("unknown or malformed encrypted v3 message"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn all_message_types_roundtrip() {
+        let id = Uuid::new_v4();
+        let update = Update::text(id, "hello 世界".to_string()).unwrap();
+        let cases = vec![Message::Identity(id), Message::Start(Header::for_update(&update)),
+            Message::Chunk { id: update.id, offset: 0, bytes: update.bytes.to_vec() },
+            Message::End(update.id), Message::Ack(update.id)];
+        for value in cases { assert_eq!(value, Message::decode(&value.encode().unwrap()).unwrap()); }
+    }
+    #[test]
+    fn bounds_and_malformed_bytes() {
+        assert!(Update::new(Uuid::new_v4(), Kind::Png, vec![7; MAX_PNG+1]).is_err());
+        assert!(Message::decode(&[START]).is_err());
+        assert!(Message::Chunk { id: Uuid::new_v4(), offset: 0, bytes: vec![] }.encode().is_err());
+        let mut raw = Message::Start(Header::for_update(&Update::text(Uuid::new_v4(), "a".into()).unwrap())).encode().unwrap();
+        raw[33] = 9;
+        assert!(Message::decode(&raw).is_err());
+    }
+}

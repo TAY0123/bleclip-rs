@@ -1,0 +1,98 @@
+name: Build, test, and publish binaries
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-x86_64
+            asset: bleclip-linux-x86_64.tar.gz
+          - os: windows-2022
+            target: windows-x86_64
+            asset: bleclip-windows-x86_64.zip
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev libudev-dev libx11-dev libxcb1-dev libwayland-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests
+        run: cargo test --all-targets
+      - name: Compile release binary
+        run: cargo build --release
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/release/bleclip README.md LICENSE SECURITY.md dist/
+          tar -czf bleclip-linux-x86_64.tar.gz -C dist .
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/bleclip.exe,README.md,LICENSE,SECURITY.md dist
+          Compress-Archive -Path dist/* -DestinationPath bleclip-windows-x86_64.zip -Force
+      - name: Upload CI build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bleclip-${{ matrix.target }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish publicly downloadable release
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Fetch build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bleclip-*
+          path: dist
+          merge-multiple: true
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum bleclip-linux-x86_64.tar.gz bleclip-windows-x86_64.zip > SHA256SUMS
+      - name: Publish as GitHub Release assets (public, no login required)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'continuous' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/v') && format('BLEClip {0}', github.ref_name) || 'BLEClip continuous builds' }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          make_latest: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          files: |
+            dist/bleclip-linux-x86_64.tar.gz
+            dist/bleclip-windows-x86_64.zip
+            dist/SHA256SUMS
+          body: |
+            Automatically built, experimental BLEClip binaries. Hardware BLE support and cross-device clipboard behavior have not been verified.
+            Install by extracting the archive. Keep the shared encryption key private.
+            The **continuous** release updates after successful builds of `main`; versioned releases are created for `v*` tags.

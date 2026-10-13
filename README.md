@@ -1,0 +1,134 @@
+# BLEClip v0.3 — encrypted P2P clipboard mesh for Windows and Linux
+
+BLEClip is a **serverless Bluetooth Low Energy** Rust CLI that automatically synchronizes **text, clipboard images, and copied files** between multiple trusted Windows/Linux computers. Each node advertises, scans, and can relay an update to other online nodes. BLE advertisements are for discovery only; actual content travels over mutually authenticated and encrypted BLE GATT connections.
+
+> **Experimental / hardware testing needed.** This revision extends an experimental v0.2 implementation. A successful `cargo test` / `cargo build` does not prove the Bluetooth hardware, Windows GATT peripheral mode, or desktop clipboard integration works. See [SECURITY.md](SECURITY.md).
+
+## Features and hard limits
+
+| Content | Source | Remote action | Maximum per clipboard event |
+| --- | --- | --- | --- |
+| Text | New copied text | Set clipboard text | 16 KiB UTF-8 |
+| Image | New copied bitmap/screenshot | Transfer lossless PNG, set remote clipboard image | 4 MiB *compressed*, maximum 8 million pixels |
+| File list | Copy 1–16 regular files in Windows Explorer / Linux file manager | Save into dedicated receive directory, set copied file list on clipboard | 8 MiB total, 16 files |
+
+**File transfers must be enabled with `--sync-files` on every node that should send, receive, or relay them.** Images and text are enabled by default; use `--no-images` to turn off image synchronization. Directories, symlinks, folders, virtual clipboard files, huge files, and file lists beyond the limits are not transferred. Original files are never deleted, and received files are never executed.
+
+### Download prebuilt binaries (public)
+
+After a successful Windows/Linux GitHub Actions run, anyone can download ZIP and tar.gz binaries directly from the [public GitHub Releases page](https://github.com/TAY0123/bleclip-rs/releases).
+
+- **Windows x86-64:** [bleclip-windows-x86_64.zip](https://github.com/TAY0123/bleclip-rs/releases/download/continuous/bleclip-windows-x86_64.zip)
+- **Linux x86-64:** [bleclip-linux-x86_64.tar.gz](https://github.com/TAY0123/bleclip-rs/releases/download/continuous/bleclip-linux-x86_64.tar.gz)
+- **Checksums:** [SHA256SUMS](https://github.com/TAY0123/bleclip-rs/releases/download/continuous/SHA256SUMS)
+
+These links become available **only after CI passes** and the `continuous` release is created. For an official versioned build, use the corresponding `v*` tagged Release. CI run artifacts also appear in the [Actions tab](https://github.com/TAY0123/bleclip-rs/actions), but GitHub Releases are the stable **anonymous public download** endpoint. These are experimental binaries, not signed or independently security-audited.
+
+### Quick start
+
+Install a recent stable Rust toolchain via <https://rustup.rs/> and build:
+
+```bash
+cargo build --release
+```
+
+Create a random 256-bit shared key on one computer:
+
+```bash
+bleclip keygen --output bleclip.key
+```
+
+Provision `bleclip.key` to the other computers **through a separate secure channel**. Do not commit it. Run the **same command** on Windows A, Linux B, and Windows/Linux C:
+
+```bash
+bleclip peer --key-file bleclip.key --sync-files
+```
+
+To save incoming files somewhere specific:
+
+```bash
+bleclip peer --key-file bleclip.key --sync-files --receive-dir ~/Downloads/BLEClip
+```
+
+Windows PowerShell:
+
+```powershell
+.\target\release\bleclip.exe peer --key-file .\bleclip.key --sync-files --receive-dir "$env:USERPROFILE\Downloads\BLEClip"
+```
+
+**Use the desktop clipboard:** copy some text, copy a screenshot/image, or select files in Explorer or your Linux file manager and press Ctrl+C. Each reachable peer receives the new item. Images are put directly on the target clipboard. Copied files are stored inside `Downloads/BLEClip/<transfer UUID>/` (or the selected receive directory), and their new local paths are put on the clipboard so Ctrl+V can paste them into a file manager that supports file-list clipboard formats. Clipboard file-list support depends on the source application and desktop session.
+
+BLEClip only sends clipboard changes after startup. It is not a standalone file-copy dialog and does not implement drag-and-drop. If a copied file is larger than the limit, the item is skipped with an error.
+
+### Bluetooth fallback roles
+
+All peers normally advertise and scan. If a Windows Bluetooth dongle cannot act as a peripheral:
+
+```bash
+bleclip peer --key-file bleclip.key --sync-files --no-advertise
+```
+
+A Linux PC with advertising support can act as an encrypted relay without being an application-level server:
+
+```bash
+bleclip peer --key-file bleclip.key --sync-files --no-scan
+```
+
+BLE central/peripheral are necessary radio roles, **not an internet/cloud service**. A Wi-Fi, LAN, or internet connection is never used for content.
+
+### Build prerequisites
+
+Arch Linux:
+
+```bash
+sudo pacman -S --needed base-devel rust pkgconf dbus bluez bluez-utils libx11 libxcb wayland
+sudo systemctl enable --now bluetooth
+cargo build --release
+```
+
+Ubuntu/Debian:
+
+```bash
+sudo apt install build-essential pkg-config libdbus-1-dev libudev-dev libx11-dev libxcb1-dev libwayland-dev
+sudo systemctl enable --now bluetooth
+cargo build --release
+```
+
+Windows: install the Rust MSVC toolchain and Microsoft C++ Build Tools. Bluetooth advertising may not be supported by some Windows drivers. Run under your desktop user, not as Administrator/root.
+
+On Linux, `arboard` supports X11 and Wayland data-control when available. Some Wayland compositors, clipboard managers, and file managers handle clipboard files/images differently. Keep the BLEClip process running so the Linux selection stays owned.
+
+## Transport, reliability, and mesh details
+
+1. Nearby peers discover a dedicated **v3** BLE service UUID and establish a GATT link.
+2. The original group-PSK authenticated ephemeral X25519 handshake derives unique per-link keys. Every application packet uses XChaCha20-Poly1305; advertisements contain no clipboard payload.
+3. The sender announces `{UUID, origin, hops, type, total size, SHA-256}`, then sends numbered **1,024-byte plaintext chunks**, each separately encrypted and framed over 20-byte GATT writes/reads (minimum standard ATT payload).
+4. Receiver rejects missing/out-of-order/truncated/tampered chunks and verifies the whole SHA-256 digest. After a complete transfer it sends an authenticated ACK. Sender retries up to three times if ACK is not received on an otherwise open link.
+5. A router applies the clipboard update and relays the **completed** payload to other authorized peers. Its event UUID remains constant over each hop, with up to eight hops and deduplication to stop loops. Copies are shared cheaply using `Arc<[u8]>`.
+6. Each GATT link can process one inbound and one outbound transfer at a time. Local updates queue up to four per link; later updates can be dropped on overload. `broadcast` queues are bounded.
+
+**ACK means the peer reassembled and authenticated the bytes, not that another desktop app has pasted the item.** There is no durable store-and-forward for peers that disconnect, no transfer continuation after reconnect, and no guarantee of exactly-once file placement after process restarts. Relays decrypt and re-encrypt content because all devices with the shared group key are mutually trusted; this is *per-link* encryption, not a zero-knowledge mesh.
+
+**Performance warning:** bulk transfer over GATT with 20-byte fragments and polled reads can be extremely slow, especially for megabyte-sized files. BLEClip v0.3 is appropriate for text, screenshots, and **small files**, not multi-gigabyte transfers. Try a few-KiB test file before larger files. A future BLE-discovered encrypted LAN or Wi-Fi transport would be much faster, but is not implemented here.
+
+**Protocol breaking change:** v3 uses distinct service UUIDs and crypto handshake labels and is incompatible with v0.2. All computers must upgrade.
+
+## Security decisions
+
+- File sync is **off by default** to prevent unexpected file disclosure and incoming disk writes.
+- Receivers accept up to 16 regular files with a total payload cap of 8 MiB; filenames are sanitized, cannot contain path traversal, and Windows device names are escaped.
+- Received files are stored in a unique per-event directory, first written to a staging directory, and then atomically renamed on the same filesystem. Existing destination directories are not overwritten; failed staging is removed.
+- Linux staging directories use mode `0700` and files `0600`; other platforms use desktop user filesystem permissions.
+- PNG decoder applies dimensions and memory limits. Unrecognized payloads and corrupt hashes are rejected.
+- Every authorized peer can inject clipboard contents or file data. Protect the PSK and do not join untrusted groups.
+
+## Test commands
+
+```bash
+cargo fmt --all -- --check
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+```
+
+Unit tests cover cryptographic authentication/replay, framed BLE chunks, large transfer assembly/ACK, digest tampering, duplicate retry, two simultaneous independently encrypted sessions, multi-peer relay loops, 16 subscribers, safe filename handling, and PNG image conversion. GitHub Actions builds Windows and Linux; actual two- or three-computer hardware tests remain necessary.
