@@ -1,0 +1,31 @@
+name: Windows and Linux Rust build
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libudev-dev libx11-dev libxcb1-dev libwayland-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all
+      - run: cargo test --all-targets
+      - run: cargo clippy --all-targets
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bleclip-${{ matrix.os }}
+          path: |
+            target/release/bleclip
+            target/release/bleclip.exe
+          if-no-files-found: error
