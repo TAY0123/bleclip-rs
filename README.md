@@ -1,4 +1,4 @@
-# BLEClip v0.4.1 — encrypted P2P clipboard mesh with a system tray
+# BLEClip v0.4.2 — encrypted P2P clipboard mesh with a system tray
 
 BLEClip is a **serverless Bluetooth Low Energy** Rust app (CLI or system tray) that automatically synchronizes **text, clipboard images, and copied files** between multiple trusted Windows/Linux computers. Each node advertises, scans, and can relay an update to other online nodes. BLE advertisements are for discovery only; actual content travels over mutually authenticated and encrypted BLE GATT connections.
 
@@ -70,6 +70,26 @@ bleclip tray --key-file bleclip.key --sync-files
 
 - **Left click** the tray icon to pause/resume clipboard sharing. **Green** = enabled; **gray with slash** = paused.
 - **Right click** for **Pause sharing / Resume sharing** and **Quit BLEClip**.
+
+- The right-click menu shows **Connection: N authenticated peers** and a
+  **Connected peers (N)** submenu listing peer ID prefixes and each link role
+  (inbound, outbound, or both). A device with simultaneous inbound/outbound
+  links counts as one peer. Raw discovered devices and unauthenticated pairing
+  attempts are not counted as connected.
+- With no connected peers, the menu shows **disconnected (searching)**. BLE
+  discovery starts as soon as the peer launches, then enumerates discovered
+  devices **every 15 seconds** while outgoing connection slots remain free.
+  Failed connection attempts use the same 15-second retry interval (previously
+  30 seconds). When a link ends, the peer immediately reevaluates discovery;
+  attempts against a recently failed Bluetooth address remain subject to the
+  15-second cooldown.
+- The menu explicitly reports the scan interval; a server-only peer shows
+  **incoming connections only** instead. BLE scanning remains active while
+  discovery is enabled: 15 seconds is the discovery/connection-attempt
+  interval, not a guaranteed BLE radio scan-window duration.
+- Inbound GATT clients that disconnect without an explicit disconnect event
+  are removed after the server's inactivity cleanup (typically 25–35 seconds).
+  Pausing or stopping a peer clears its connection list immediately.
 - Pausing cancels advertising, scanning and active encrypted BLE connections, dropping queued/in-flight clipboard transfers. Resuming reinitializes BLE, reconnects peers, and starts monitoring again. Content already on the clipboard is not uploaded on resume; only subsequent changes are sent.
 - Text and image sync use the same settings as regular peer mode; use `--sync-files` to opt in to file transfer, `--no-images` to disable images, and `--no-advertise` when a device cannot offer the peripheral role.
 - The headless `bleclip peer` command remains supported for unattended terminals/services.

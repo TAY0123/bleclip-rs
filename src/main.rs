@@ -6,6 +6,7 @@ mod identity;
 mod message;
 mod platform;
 mod router;
+mod status;
 mod transfer;
 mod transport;
 mod tray;
@@ -20,6 +21,7 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -155,6 +157,7 @@ fn read_key(path: &Path) -> Result<Psk> {
 pub(crate) async fn run_peer(
     config: PeerOptions,
     mut shutdown: Option<watch::Receiver<tray::TrayState>>,
+    connections: Arc<status::Connections>,
 ) -> Result<()> {
     let PeerOptions {
         key_file,
@@ -229,11 +232,13 @@ pub(crate) async fn run_peer(
         receive_dir.display()
     );
     println!("Discovery: {}, advertising: {}", scan, advertise);
+    connections.set_roles(scan, advertise);
 
     let advertising = if advertise {
         let updates = to_peers_tx.clone();
         let sender = from_peers_tx.clone();
         let name = name.clone();
+        let server_connections = Arc::clone(&connections);
         Some(tokio::spawn(async move {
             loop {
                 if let Err(error) = transport::server::run(
@@ -243,6 +248,7 @@ pub(crate) async fn run_peer(
                     max_inbound,
                     sender.clone(),
                     updates.clone(),
+                    Arc::clone(&server_connections),
                 )
                 .await
                 {
@@ -264,6 +270,7 @@ pub(crate) async fn run_peer(
     let scanning = if scan {
         let updates = to_peers_tx.clone();
         let sender = from_peers_tx.clone();
+        let client_connections = Arc::clone(&connections);
         Some(tokio::spawn(async move {
             loop {
                 if let Err(error) = transport::client::run(
@@ -273,6 +280,7 @@ pub(crate) async fn run_peer(
                     max_outbound,
                     sender.clone(),
                     updates.clone(),
+                    Arc::clone(&client_connections),
                 )
                 .await
                 {
@@ -309,6 +317,7 @@ pub(crate) async fn run_peer(
         task.abort();
         let _ = task.await;
     }
+    connections.reset();
     result
 }
 
@@ -372,7 +381,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Peer(options) => run_peer(options, None).await,
+        Command::Peer(options) => run_peer(options, None, status::Connections::new()).await,
         Command::Tray(options) => tray::run(options),
         Command::Serve {
             key_file,
@@ -397,6 +406,7 @@ async fn main() -> Result<()> {
                     receive_dir,
                 },
                 None,
+                status::Connections::new(),
             )
             .await
         }
@@ -423,6 +433,7 @@ async fn main() -> Result<()> {
                     receive_dir,
                 },
                 None,
+                status::Connections::new(),
             )
             .await
         }

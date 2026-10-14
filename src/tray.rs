@@ -1,11 +1,14 @@
 //! Windows Shell_NotifyIcon and Linux StatusNotifierItem (KDE Plasma / Wayland).
 //! Pausing terminates BLE sessions rather than merely hiding clipboard events.
-use crate::PeerOptions;
+use crate::{
+    status::{ConnectionSnapshot, Connections},
+    PeerOptions,
+};
 use anyhow::{Context, Result};
-use std::{thread, time::Duration};
+use std::{sync::Arc, thread, time::Duration};
 use tokio::{runtime::Builder, sync::watch};
 use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
     Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
@@ -120,19 +123,111 @@ fn pump_native_events() -> bool {
     false
 }
 
-async fn worker(config: PeerOptions, mut control: watch::Receiver<TrayState>) {
+/// The menu changes only when sharing or the authenticated link snapshot changes.
+/// Cap visible rows, since a large BLE mesh must not create an enormous tray menu.
+const MAX_PEER_MENU_ROWS: usize = 12;
+
+fn connection_label(state: TrayState, snapshot: &ConnectionSnapshot) -> String {
+    if !state.enabled || state.quit {
+        return "Connection: paused".to_string();
+    }
+    if !snapshot.peers.is_empty() {
+        let count = snapshot.peers.len();
+        return format!(
+            "Connection: {count} authenticated peer{}",
+            if count == 1 { "" } else { "s" }
+        );
+    }
+    if snapshot.scanning {
+        "Connection: disconnected (searching)".to_string()
+    } else if snapshot.advertising {
+        "Connection: waiting for inbound peers".to_string()
+    } else {
+        "Connection: initializing BLE".to_string()
+    }
+}
+
+fn scan_label(state: TrayState, snapshot: &ConnectionSnapshot) -> &'static str {
+    if !state.enabled || state.quit {
+        "Discovery: paused"
+    } else if snapshot.scanning {
+        "Discovery: startup + every 15 seconds"
+    } else if snapshot.advertising {
+        "Discovery: incoming connections only"
+    } else {
+        "Discovery: initializing"
+    }
+}
+
+fn refresh_connections(
+    tray: &TrayIcon,
+    connection_item: &MenuItem,
+    scan_item: &MenuItem,
+    peers_submenu: &Submenu,
+    rows: &mut Vec<MenuItem>,
+    state: TrayState,
+    snapshot: &ConnectionSnapshot,
+) -> Result<()> {
+    let summary = connection_label(state, snapshot);
+    connection_item.set_text(&summary);
+    scan_item.set_text(scan_label(state, snapshot));
+    peers_submenu.set_text(format!(
+        "Connected peers ({})",
+        if state.enabled {
+            snapshot.peers.len()
+        } else {
+            0
+        }
+    ));
+
+    for item in rows.drain(..) {
+        peers_submenu.remove(&item)?;
+    }
+    if !state.enabled || snapshot.peers.is_empty() {
+        rows.push(MenuItem::new("No authenticated peers", false, None));
+    } else {
+        for peer in snapshot.peers.iter().take(MAX_PEER_MENU_ROWS) {
+            rows.push(MenuItem::new(peer.label(), false, None));
+        }
+        if snapshot.peers.len() > MAX_PEER_MENU_ROWS {
+            rows.push(MenuItem::new(
+                format!("... and {} more", snapshot.peers.len() - MAX_PEER_MENU_ROWS),
+                false,
+                None,
+            ));
+        }
+    }
+    for item in rows.iter() {
+        peers_submenu.append(item)?;
+    }
+    tray.set_tooltip(Some(format!("BLEClip - {summary}")))?;
+    Ok(())
+}
+
+async fn worker(
+    config: PeerOptions,
+    mut control: watch::Receiver<TrayState>,
+    connections: Arc<Connections>,
+) {
     loop {
         let state = *control.borrow_and_update();
         if state.quit {
             break;
         }
         if !state.enabled {
+            connections.reset();
             if control.changed().await.is_err() {
                 break;
             }
             continue;
         }
-        if let Err(error) = crate::run_peer(config.clone(), Some(control.clone())).await {
+        if let Err(error) = crate::run_peer(
+            config.clone(),
+            Some(control.clone()),
+            Arc::clone(&connections),
+        )
+        .await
+        {
             eprintln!("BLEClip peer unavailable: {error:#}; retrying while sharing is enabled");
         }
         // Pending encrypted frames are discarded when the BLE tasks are stopped.
@@ -151,8 +246,16 @@ async fn worker(config: PeerOptions, mut control: watch::Receiver<TrayState>) {
 /// The tray stays on the UI thread; the peer runs on a dedicated Tokio runtime.
 pub(crate) fn run(config: PeerOptions) -> Result<()> {
     let menu = Menu::new();
+    let connection_item = MenuItem::new("Connection: initializing BLE", false, None);
+    let scan_item = MenuItem::new("Discovery: startup + every 15 seconds", false, None);
+    let peers_submenu = Submenu::new("Connected peers (0)", true);
+    let mut rows: Vec<MenuItem> = Vec::new();
     let toggle_menu = MenuItem::new("Pause sharing", true, None);
     let quit_menu = MenuItem::new("Quit BLEClip", true, None);
+    menu.append(&connection_item)?;
+    menu.append(&scan_item)?;
+    menu.append(&peers_submenu)?;
+    menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&toggle_menu)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&quit_menu)?;
@@ -166,6 +269,8 @@ pub(crate) fn run(config: PeerOptions) -> Result<()> {
         .build()
         .context("system tray is unavailable; use bleclip peer for headless operation")?;
     let tray_id = tray.id().clone();
+    let connections = Connections::new();
+    let snapshots = connections.subscribe();
     let (control_tx, control_rx) = watch::channel(TrayState {
         enabled: true,
         quit: false,
@@ -174,13 +279,14 @@ pub(crate) fn run(config: PeerOptions) -> Result<()> {
         .name("bleclip-peer".to_string())
         .spawn(move || -> Result<()> {
             let rt = Builder::new_multi_thread().enable_all().build()?;
-            rt.block_on(worker(config, control_rx));
+            rt.block_on(worker(config, control_rx, connections));
             Ok(())
         })
         .context("unable to spawn clipboard synchronization worker")?;
 
-    println!("BLEClip tray: left-click toggles sharing; right-click opens menu.");
+    println!("BLEClip tray: left-click toggles sharing; right-click shows connected peers.");
     let ui_result = (|| -> Result<()> {
+        let mut shown: Option<(TrayState, ConnectionSnapshot)> = None;
         loop {
             if pump_native_events() || background.is_finished() {
                 break;
@@ -208,6 +314,19 @@ pub(crate) fn run(config: PeerOptions) -> Result<()> {
             }
             if should_quit {
                 break;
+            }
+            let current = (*control_tx.borrow(), snapshots.borrow().clone());
+            if shown.as_ref() != Some(&current) {
+                refresh_connections(
+                    &tray,
+                    &connection_item,
+                    &scan_item,
+                    &peers_submenu,
+                    &mut rows,
+                    current.0,
+                    &current.1,
+                )?;
+                shown = Some(current);
             }
             thread::sleep(Duration::from_millis(70));
         }
@@ -248,6 +367,32 @@ mod tests {
             quit: true,
         };
         assert_eq!(quit.toggle(), quit);
+    }
+    #[test]
+    fn connection_menu_reports_scanning_and_authenticated_count() {
+        let enabled = TrayState {
+            enabled: true,
+            quit: false,
+        };
+        let paused = enabled.toggle();
+        let scanning = ConnectionSnapshot {
+            scanning: true,
+            advertising: false,
+            peers: vec![],
+        };
+        assert!(connection_label(enabled, &scanning).contains("disconnected"));
+        assert!(scan_label(enabled, &scanning).contains("15 seconds"));
+        assert!(connection_label(paused, &scanning).contains("paused"));
+        let peer = crate::status::PeerView {
+            id: uuid::Uuid::nil(),
+            inbound: 1,
+            outbound: 1,
+        };
+        let online = ConnectionSnapshot {
+            peers: vec![peer],
+            ..scanning
+        };
+        assert!(connection_label(enabled, &online).contains("1 authenticated peer"));
     }
     #[test]
     fn status_icon_pixels_change_with_state() {

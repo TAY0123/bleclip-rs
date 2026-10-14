@@ -6,6 +6,7 @@ use super::{READ_ID, SERVICE_ID, WRITE_ID};
 use crate::{
     crypto::{self, PendingServer, Psk, Session},
     message::{Message, Update},
+    status::{Connections, LinkRole},
     transfer::{Incoming, Outgoing},
     wire::{self, Decoder},
 };
@@ -21,14 +22,24 @@ use ble_peripheral_rust::{
     },
     Peripheral, PeripheralImpl,
 };
-use std::{collections::{HashMap, VecDeque}, time::{Duration, Instant}};
-use tokio::{sync::{broadcast, mpsc}, time::{interval, sleep, timeout}};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::{
+    sync::{broadcast, mpsc},
+    time::{interval, sleep, timeout},
+};
 use uuid::Uuid;
 
 enum PeerState {
     Unauthenticated,
     WaitingForFinish(PendingServer),
-    Authenticated { session: Session, remote_id: Option<Uuid> },
+    Authenticated {
+        session: Session,
+        remote_id: Option<Uuid>,
+    },
 }
 
 struct Peer {
@@ -83,7 +94,10 @@ impl Peer {
             let session = pending.finish(psk, payload)?;
             let identity = Message::Identity(own_id).encode()?;
             wire::queue_frame(&mut self.tx, &session.seal(&identity)?)?;
-            self.state = PeerState::Authenticated { session, remote_id: None };
+            self.state = PeerState::Authenticated {
+                session,
+                remote_id: None,
+            };
             return Ok(None);
         }
         match &mut self.state {
@@ -91,18 +105,27 @@ impl Peer {
                 let message = Message::decode(&session.open(payload)?)?;
                 match message {
                     Message::Identity(remote) => {
-                        if remote == own_id { bail!("self connection rejected"); }
+                        if remote == own_id {
+                            bail!("self connection rejected");
+                        }
                         if remote_id.is_some() && *remote_id != Some(remote) {
                             bail!("node identity changed during session");
                         }
                         *remote_id = Some(remote);
                         Ok(None)
                     }
-                    Message::Ack(id) => { self.sender.ack(id); Ok(None) }
+                    Message::Ack(id) => {
+                        self.sender.ack(id);
+                        Ok(None)
+                    }
                     msg => {
-                        if remote_id.is_none() { bail!("content before node identity"); }
+                        if remote_id.is_none() {
+                            bail!("content before node identity");
+                        }
                         let received = self.receiver.handle(msg, Instant::now())?;
-                        if let Some(id) = received.ack { self.receipts.push_back(id); }
+                        if let Some(id) = received.ack {
+                            self.receipts.push_back(id);
+                        }
                         Ok(received.update)
                     }
                 }
@@ -112,19 +135,34 @@ impl Peer {
     }
 
     fn offer(&mut self, update: &Update) -> Result<()> {
-        if let PeerState::Authenticated { remote_id: Some(remote_id), .. } = &self.state {
-            if *remote_id != update.origin { self.sender.enqueue(update.clone())?; }
+        if let PeerState::Authenticated {
+            remote_id: Some(remote_id),
+            ..
+        } = &self.state
+        {
+            if *remote_id != update.origin {
+                self.sender.enqueue(update.clone())?;
+            }
         }
         Ok(())
     }
 
     /// Produce only one bounded encrypted transfer fragment when polled.
     fn refill(&mut self) -> Result<()> {
-        if !self.tx.is_empty() { return Ok(()); }
-        if let PeerState::Authenticated { session, remote_id: Some(_), .. } = &mut self.state {
+        if !self.tx.is_empty() {
+            return Ok(());
+        }
+        if let PeerState::Authenticated {
+            session,
+            remote_id: Some(_),
+            ..
+        } = &mut self.state
+        {
             let message = if let Some(id) = self.receipts.pop_front() {
                 Some(Message::Ack(id))
-            } else { self.sender.next(Instant::now()) };
+            } else {
+                self.sender.next(Instant::now())
+            };
             if let Some(message) = message {
                 wire::queue_frame(&mut self.tx, &session.seal(&message.encode()?)?)?;
             }
@@ -140,7 +178,11 @@ pub async fn run(
     max_inbound: usize,
     from_peers: mpsc::Sender<Update>,
     to_peers: broadcast::Sender<Update>,
+    connections: Arc<Connections>,
 ) -> Result<()> {
+    // On task cancellation, remove stale inbound tray entries even if the BLE
+    // peripheral SDK does not emit a per-client disconnect event.
+    let _role_guard = connections.track_role(LinkRole::Inbound);
     let (sender_tx, mut receiver_rx) = mpsc::channel::<PeripheralEvent>(256);
     let mut peripheral = Peripheral::new(sender_tx)
         .await
@@ -175,8 +217,14 @@ pub async fn run(
             },
         ],
     };
-    peripheral.add_service(&service).await.context("local GATT registration failed")?;
-    peripheral.start_advertising(&name, &[SERVICE_ID]).await.context("BLE advertising failed")?;
+    peripheral
+        .add_service(&service)
+        .await
+        .context("local GATT registration failed")?;
+    peripheral
+        .start_advertising(&name, &[SERVICE_ID])
+        .await
+        .context("BLE advertising failed")?;
     println!("BLE peripheral advertising ({name}); max inbound peers: {max_inbound}");
 
     let mut peers: HashMap<String, Peer> = HashMap::new();
@@ -187,7 +235,11 @@ pub async fn run(
         loop {
             tokio::select! {
                 _ = cleanup.tick() => {
-                    peers.retain(|_, p| p.last_activity.elapsed() < Duration::from_secs(25));
+                    peers.retain(|client, p| {
+                        let keep = p.last_activity.elapsed() < Duration::from_secs(25);
+                        if !keep { connections.disconnected(LinkRole::Inbound, client); }
+                        keep
+                    });
                 }
                 latest = updates.recv() => {
                     match latest {
@@ -240,13 +292,18 @@ pub async fn run(
                             } else {
                                 // Distinct BLE centrals get distinct crypto sessions.
                                 if !peers.contains_key(&request.client) && peers.len() >= max_inbound {
-                                    peers.retain(|_, p| p.last_activity.elapsed() < Duration::from_secs(30));
+                                    peers.retain(|client, p| {
+                                        let keep = p.last_activity.elapsed() < Duration::from_secs(30);
+                                        if !keep { connections.disconnected(LinkRole::Inbound, client); }
+                                        keep
+                                    });
                                 }
                                 if !peers.contains_key(&request.client) && peers.len() >= max_inbound {
                                     response = RequestResponse::UnlikelyError;
                                 } else {
                                     let peer = peers.entry(request.client.clone()).or_insert_with(Peer::new);
                                     peer.last_activity = Instant::now();
+                                    let previous_id = peer.remote_id();
                                     let result = peer.rx.push(&value).and_then(|packets| {
                                         for packet in packets {
                                             if let Some(update) = peer.on_message(&psk, own_id, &packet)? {
@@ -255,10 +312,20 @@ pub async fn run(
                                         }
                                         Ok(())
                                     });
+                                    let current_id = peer.remote_id();
                                     if let Err(error) = result {
                                         eprintln!("Rejected inbound BLE message from {}: {error:#}", request.client);
                                         peers.remove(&request.client);
+                                        connections.disconnected(LinkRole::Inbound, &request.client);
                                         response = RequestResponse::UnlikelyError;
+                                    } else if current_id != previous_id {
+                                        // An authenticated identity, not a raw BLE write, makes
+                                        // a peer visible in the tray's connection list.
+                                        if let Some(id) = current_id {
+                                            connections.connected(LinkRole::Inbound, request.client.clone(), id);
+                                        } else {
+                                            connections.disconnected(LinkRole::Inbound, &request.client);
+                                        }
                                     }
                                 }
                             }
@@ -296,11 +363,20 @@ mod tests {
             let mut decoder = Decoder::default();
             let reply = loop {
                 let data = decoder.push(&wire::pop_chunk(&mut peer.tx)).unwrap();
-                if let Some(reply) = data.into_iter().next() { break reply; }
+                if let Some(reply) = data.into_iter().next() {
+                    break reply;
+                }
             };
             let (session, finish) = initiator.finish(&key, &reply).unwrap();
             peer.on_message(&key, server_id, &finish).unwrap();
-            peer.on_message(&key, server_id, &session.seal(&Message::Identity(client_id).encode().unwrap()).unwrap()).unwrap();
+            peer.on_message(
+                &key,
+                server_id,
+                &session
+                    .seal(&Message::Identity(client_id).encode().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
             clients.push(session);
         }
         assert_eq!(peers[0].remote_id(), Some(ids[0]));
@@ -317,15 +393,21 @@ mod tests {
                 let chunk = wire::pop_chunk(&mut peer.tx);
                 let frames = decoder.push(&chunk).unwrap();
                 for f in frames {
-                    if let Some(bytes) = &first { let _ = bytes; }
-                    if index == 0 && first.is_none() { first = Some(f.clone()); }
+                    if let Some(bytes) = &first {
+                        let _ = bytes;
+                    }
+                    if index == 0 && first.is_none() {
+                        first = Some(f.clone());
+                    }
                     let message = Message::decode(&session.open(&f).unwrap()).unwrap();
                     match message {
-                        Message::Identity(_) => {},
+                        Message::Identity(_) => {}
                         msg => {
                             n += 1;
                             let received = incoming.handle(msg, Instant::now()).unwrap();
-                            if let Some(got) = received.update { assert_eq!(got, update); }
+                            if let Some(got) = received.update {
+                                assert_eq!(got, update);
+                            }
                         }
                     }
                 }

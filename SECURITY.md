@@ -24,3 +24,13 @@ the unsupported advertising role and continues scanning for advertising
 peers. This does not change the authentication or cryptographic requirements
 and does not enable LAN or internet transport. At least one device must
 advertise for the BLE link to form.
+
+
+## Tray connection status and discovery cadence
+
+The tray menu lists remote node ID prefixes only after an authenticated BLE
+identity exchange; detecting a radio advertisement is not proof of a trusted
+peer. A peer with multiple links is counted once. Inbound connection entries
+can remain visible briefly after an unannounced radio disconnect until
+inactivity cleanup. Discovery retries at 15-second intervals to avoid
+tight reconnection loops.

@@ -5,6 +5,7 @@ use super::{READ_ID, SERVICE_ID, WRITE_ID};
 use crate::{
     crypto::{Initiator, Psk, Session},
     message::{Message, Update},
+    status::{Connections, LinkRole},
     transfer::{Incoming, Outgoing},
     wire::{self, Decoder},
 };
@@ -13,30 +14,60 @@ use btleplug::{
     api::{Central, Characteristic, Manager as _, Peripheral as _, ScanFilter, WriteType},
     platform::{Manager, Peripheral},
 };
-use std::{collections::{HashMap, HashSet}, sync::Arc, time::{Duration, Instant}};
-use tokio::{sync::{broadcast, mpsc, Mutex}, task::JoinSet, time::{interval, sleep, timeout}};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tokio::{
+    sync::{broadcast, mpsc, Mutex},
+    task::JoinSet,
+    time::{interval, sleep, timeout},
+};
 use uuid::Uuid;
 
 const ATT_OPERATION_TIMEOUT: Duration = Duration::from_secs(12);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Discovery starts immediately, then polls the scanned BLE cache every 15 s.
+/// Failed connection attempts are held off for one interval (not 30 seconds).
+pub(crate) const DISCOVERY_INTERVAL: Duration = Duration::from_secs(15);
+
+fn retry_ready(since_attempt: Duration) -> bool {
+    since_attempt >= DISCOVERY_INTERVAL
+}
 
 async fn send_packet(peer: &Peripheral, ch: &Characteristic, payload: &[u8]) -> Result<()> {
     let bytes = wire::frame(payload)?;
     for chunk in bytes.chunks(wire::ATT_CHUNK) {
-        timeout(ATT_OPERATION_TIMEOUT, peer.write(ch, chunk, WriteType::WithResponse))
-            .await.context("GATT write timeout")??;
+        timeout(
+            ATT_OPERATION_TIMEOUT,
+            peer.write(ch, chunk, WriteType::WithResponse),
+        )
+        .await
+        .context("GATT write timeout")??;
     }
     Ok(())
 }
 
-async fn next_frame(peer: &Peripheral, ch: &Characteristic, decoder: &mut Decoder, limit: Duration) -> Result<Vec<u8>> {
+async fn next_frame(
+    peer: &Peripheral,
+    ch: &Characteristic,
+    decoder: &mut Decoder,
+    limit: Duration,
+) -> Result<Vec<u8>> {
     let deadline = Instant::now() + limit;
     loop {
-        ensure!(Instant::now() < deadline, "authentication handshake timed out");
-        let chunk = timeout(ATT_OPERATION_TIMEOUT, peer.read(ch)).await
+        ensure!(
+            Instant::now() < deadline,
+            "authentication handshake timed out"
+        );
+        let chunk = timeout(ATT_OPERATION_TIMEOUT, peer.read(ch))
+            .await
             .context("BLE GATT read timed out")??;
         let mut decoded = decoder.push(&chunk)?;
-        if !decoded.is_empty() { return Ok(decoded.remove(0)); }
+        if !decoded.is_empty() {
+            return Ok(decoded.remove(0));
+        }
         sleep(Duration::from_millis(100)).await;
     }
 }
@@ -48,38 +79,63 @@ async fn run_authenticated(
     from_peers: mpsc::Sender<Update>,
     to_peers: broadcast::Sender<Update>,
     active_nodes: Arc<Mutex<HashSet<Uuid>>>,
+    connections: Arc<Connections>,
 ) -> Result<()> {
-    timeout(CONNECT_TIMEOUT, peer.discover_services()).await
+    timeout(CONNECT_TIMEOUT, peer.discover_services())
+        .await
         .context("BLE service discovery timeout")??;
     let chars = peer.characteristics();
-    let write_char = chars.iter().find(|ch| ch.uuid == WRITE_ID).cloned()
+    let write_char = chars
+        .iter()
+        .find(|ch| ch.uuid == WRITE_ID)
+        .cloned()
         .context("no BLEClip WRITE characteristic")?;
-    let read_char = chars.iter().find(|ch| ch.uuid == READ_ID).cloned()
+    let read_char = chars
+        .iter()
+        .find(|ch| ch.uuid == READ_ID)
+        .cloned()
         .context("no BLEClip READ characteristic")?;
 
     let (initiator, hello) = Initiator::start(psk);
     send_packet(peer, &write_char, &hello).await?;
     let mut decoder = Decoder::default();
     let response = next_frame(peer, &read_char, &mut decoder, Duration::from_secs(20)).await?;
-    let (mut session, finish) = initiator.finish(psk, &response)
+    let (mut session, finish) = initiator
+        .finish(psk, &response)
         .context("remote BLEClip authentication failed")?;
     send_packet(peer, &write_char, &finish).await?;
     let hello = Message::Identity(own_id).encode()?;
     send_packet(peer, &write_char, &session.seal(&hello)?).await?;
-    let identity_reply = next_frame(peer, &read_char, &mut decoder, Duration::from_secs(20)).await?;
+    let identity_reply =
+        next_frame(peer, &read_char, &mut decoder, Duration::from_secs(20)).await?;
     let remote_id = match Message::decode(&session.open(&identity_reply)?)? {
         Message::Identity(id) => id,
         _ => bail!("peer did not send an authenticated node identity"),
     };
-    ensure!(remote_id != own_id, "ignoring self-discovered BLE advertisement");
+    ensure!(
+        remote_id != own_id,
+        "ignoring self-discovered BLE advertisement"
+    );
 
     {
         let mut ids = active_nodes.lock().await;
-        if !ids.insert(remote_id) { bail!("already have an outgoing connection to {remote_id}"); }
+        if !ids.insert(remote_id) {
+            bail!("already have an outgoing connection to {remote_id}");
+        }
     }
+    let _link = connections.track(LinkRole::Outbound, peer.id().to_string(), remote_id);
     println!("Outgoing encrypted BLE connection to {remote_id}");
-    let result = connected_loop(peer, &write_char, &read_char, &mut decoder, &mut session,
-        remote_id, from_peers, to_peers).await;
+    let result = connected_loop(
+        peer,
+        &write_char,
+        &read_char,
+        &mut decoder,
+        &mut session,
+        remote_id,
+        from_peers,
+        to_peers,
+    )
+    .await;
     active_nodes.lock().await.remove(&remote_id);
     result
 }
@@ -160,11 +216,23 @@ async fn connect_one(
     from_peers: mpsc::Sender<Update>,
     to_peers: broadcast::Sender<Update>,
     active_nodes: Arc<Mutex<HashSet<Uuid>>>,
+    connections: Arc<Connections>,
 ) -> Result<()> {
     if !peer.is_connected().await? {
-        timeout(CONNECT_TIMEOUT, peer.connect()).await.context("BLE connect timeout")??;
+        timeout(CONNECT_TIMEOUT, peer.connect())
+            .await
+            .context("BLE connect timeout")??;
     }
-    let result = run_authenticated(&peer, &psk, own_id, from_peers, to_peers, active_nodes).await;
+    let result = run_authenticated(
+        &peer,
+        &psk,
+        own_id,
+        from_peers,
+        to_peers,
+        active_nodes,
+        connections,
+    )
+    .await;
     let _ = timeout(Duration::from_secs(5), peer.disconnect()).await;
     result
 }
@@ -176,18 +244,29 @@ pub async fn run(
     max_outbound: usize,
     from_peers: mpsc::Sender<Update>,
     to_peers: broadcast::Sender<Update>,
+    connections: Arc<Connections>,
 ) -> Result<()> {
-    let manager = Manager::new().await.context("BLE central manager unavailable")?;
-    let adapter = manager.adapters().await?.into_iter().next()
+    let manager = Manager::new()
+        .await
+        .context("BLE central manager unavailable")?;
+    let adapter = manager
+        .adapters()
+        .await?
+        .into_iter()
+        .next()
         .context("no BLE adapter available for scanning")?;
-    adapter.start_scan(ScanFilter::default()).await.context("BLE discovery scan failed")?;
+    adapter
+        .start_scan(ScanFilter::default())
+        .await
+        .context("BLE discovery scan failed")?;
     println!("Scanning for nearby BLEClip peers (max outgoing links: {max_outbound})");
 
     let active_nodes = Arc::new(Mutex::new(HashSet::<Uuid>::new()));
     let mut active = HashSet::<String>::new();
     let mut retried = HashMap::<String, Instant>::new();
     let mut workers = JoinSet::<(String, Result<()>)>::new();
-    let mut tick = interval(Duration::from_secs(3));
+    let mut tick = interval(DISCOVERY_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = tick.tick() => {
@@ -202,7 +281,7 @@ pub async fn run(
                 for candidate in devices {
                     if active.len() >= max_outbound { break; }
                     let id = candidate.id().to_string();
-                    if active.contains(&id) || retried.get(&id).is_some_and(|t| t.elapsed() < Duration::from_secs(30)) {
+                    if active.contains(&id) || retried.get(&id).is_some_and(|t| !retry_ready(t.elapsed())) {
                         continue;
                     }
                     let props = match candidate.properties().await {
@@ -219,8 +298,9 @@ pub async fn run(
                     let tx = from_peers.clone();
                     let broadcast = to_peers.clone();
                     let nodes = active_nodes.clone();
+                    let tracker = Arc::clone(&connections);
                     workers.spawn(async move {
-                        let result = connect_one(candidate, psk, own_id, tx, broadcast, nodes).await;
+                        let result = connect_one(candidate, psk, own_id, tx, broadcast, nodes, tracker).await;
                         (id, result)
                     });
                 }
@@ -232,14 +312,33 @@ pub async fn run(
                     Some(Ok((id, result))) => {
                         active.remove(&id);
                         retried.insert(id.clone(), Instant::now());
+                        // A disconnected link frees a connection slot: inspect
+                        // available peers immediately, then use 15-second retries.
+                        tick.reset_immediately();
                         if let Err(error) = result {
                             eprintln!("BLE peer {id} link ended: {error:#}");
                         }
                     }
-                    Some(Err(error)) => eprintln!("BLE connection task failed: {error}"),
+                    Some(Err(error)) => {
+                        eprintln!("BLE connection task failed: {error}");
+                        tick.reset_immediately();
+                    },
                     None => {}
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    #[test]
+    fn retry_interval_is_fifteen_seconds() {
+        assert_eq!(DISCOVERY_INTERVAL, Duration::from_secs(15));
+        assert!(!retry_ready(Duration::from_secs(14)));
+        assert!(!retry_ready(Duration::from_millis(14999)));
+        assert!(retry_ready(Duration::from_secs(15)));
+        assert!(retry_ready(Duration::from_secs(30)));
     }
 }

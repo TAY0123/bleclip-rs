@@ -1,6 +1,6 @@
 [package]
 name = "bleclip"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 license = "MIT"
 description = "Serverless multi-peer encrypted text, image, and file clipboard sync over BLE on Windows and Linux"
