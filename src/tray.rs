@@ -244,13 +244,16 @@ async fn worker(
 }
 
 /// The tray stays on the UI thread; the peer runs on a dedicated Tokio runtime.
-pub(crate) fn run(config: PeerOptions) -> Result<()> {
+pub(crate) fn run(mut config: PeerOptions) -> Result<()> {
+    config.sync_files = true;
     let menu = Menu::new();
     let connection_item = MenuItem::new("Connection: initializing BLE", false, None);
     let scan_item = MenuItem::new("Discovery: startup + every 15 seconds", false, None);
     let peers_submenu = Submenu::new("Connected peers (0)", true);
     let mut rows: Vec<MenuItem> = Vec::new();
     let toggle_menu = MenuItem::new("Pause sharing", true, None);
+    let send_file = MenuItem::new("Send file…", true, None);
+    menu.append(&send_file)?;
     let quit_menu = MenuItem::new("Quit BLEClip", true, None);
     menu.append(&connection_item)?;
     menu.append(&scan_item)?;
@@ -308,6 +311,23 @@ pub(crate) fn run(config: PeerOptions) -> Result<()> {
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 if &event.id == toggle_menu.id() {
                     toggle(&control_tx, &tray, &toggle_menu)?;
+                } else if &event.id == send_file.id() {
+                    if control_tx.borrow().enabled {
+                        thread::spawn(|| match crate::desktop::choose_files() {
+                            Ok(paths) if !paths.is_empty() => {
+                                if file_commands().send(paths).is_err() {
+                                    crate::desktop::notify(
+                                        "Cannot send files",
+                                        "Sharing is paused or the Bluetooth worker is unavailable.",
+                                    );
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                crate::desktop::notify("Cannot send file", &format!("{err:#}"))
+                            }
+                        });
+                    }
                 } else if &event.id == quit_menu.id() {
                     should_quit = true;
                 }
@@ -414,4 +434,11 @@ pub(crate) fn show_error(message: &str) {
             MB_ICONERROR | MB_OK,
         );
     }
+}
+
+/// UI selections are delivered only to a currently running clipboard owner.
+pub(crate) fn file_commands() -> &'static tokio::sync::broadcast::Sender<Vec<std::path::PathBuf>> {
+    static COMMANDS: std::sync::OnceLock<tokio::sync::broadcast::Sender<Vec<std::path::PathBuf>>> =
+        std::sync::OnceLock::new();
+    COMMANDS.get_or_init(|| tokio::sync::broadcast::channel(8).0)
 }

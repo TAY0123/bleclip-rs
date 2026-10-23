@@ -26,6 +26,9 @@ tokio = { version = "1.44", features = ["full"] }
 uuid = { version = "1.11", features = ["v4"] }
 x25519-dalek = "2.0.1"
 zeroize = "1.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"
 
 [profile.release]
 lto = "thin"
@@ -34,9 +37,14 @@ strip = true
 # The Linux KSNI backend supports KDE Plasma/Wayland without GTK libraries.
 [target.'cfg(target_os = "linux")'.dependencies]
 tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
+x11rb = "0.13"
+wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+libc = "0.2"
+percent-encoding = "2"
 
 # The native Win32 tray uses a message pump (no GTK or Tauri dependency).
 [target.'cfg(windows)'.dependencies]
 tray-icon = { version = "0.26.1", default-features = false }
-windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_Graphics_Gdi"] }
 windows = { version = "0.62.2", features = ["Devices_Bluetooth"] }

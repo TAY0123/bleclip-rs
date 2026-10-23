@@ -1,6 +1,8 @@
 #![cfg_attr(all(windows, feature = "tray-gui"), windows_subsystem = "windows")]
 mod clipboard;
 mod crypto;
+mod desktop;
+mod file_clipboard;
 mod files;
 mod identity;
 mod message;
@@ -107,7 +109,7 @@ pub(crate) struct PeerOptions {
     /// Skip BLE central role (use if simultaneous scanning isn't supported).
     #[arg(long)]
     no_scan: bool,
-    /// Permit automatic file-list transfer (off by default to avoid unexpected disk writes).
+    /// Enable file offers and transfers (always enabled in tray mode).
     #[arg(long)]
     sync_files: bool,
     /// Disable automatic clipboard image synchronization.
@@ -322,11 +324,10 @@ pub(crate) async fn run_peer(
 }
 
 fn default_receive_dir() -> Result<PathBuf> {
-    #[cfg(windows)]
-    let home = std::env::var_os("USERPROFILE").context("USERPROFILE not set")?;
-    #[cfg(not(windows))]
-    let home = std::env::var_os("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join("Downloads").join("BLEClip"))
+    let downloads = dirs::download_dir()
+        .or_else(|| dirs::home_dir().map(|home| home.join("Downloads")))
+        .context("cannot locate the Downloads directory; set --receive-dir")?;
+    Ok(downloads.join("BLEClip"))
 }
 
 #[tokio::main]
@@ -350,7 +351,7 @@ async fn main() -> Result<()> {
                 max_outbound: 8,
                 no_advertise: false,
                 no_scan: false,
-                sync_files: false,
+                sync_files: true,
                 no_images: false,
                 receive_dir: None,
             }),

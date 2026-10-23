@@ -10,9 +10,10 @@ BLEClip is a **serverless Bluetooth Low Energy** Rust app (CLI or system tray) t
 | --- | --- | --- | --- |
 | Text | New copied text | Set clipboard text | 16 KiB UTF-8 |
 | Image | New copied bitmap/screenshot | Transfer lossless PNG, set remote clipboard image | 4 MiB *compressed*, maximum 8 million pixels |
-| File list | Copy 1–16 regular files in Windows Explorer / Linux file manager | Save into dedicated receive directory, set copied file list on clipboard | 8 MiB total, 16 files |
+| File list | Copy 1–16 regular files in Windows Explorer / Linux file manager | Announce names/sizes; download on paste and expose local file paths | 8 MiB total, 16 files |
+| Send file… | Right-click tray menu, choose files | Download immediately into Downloads/BLEClip | 8 MiB total, 16 files |
 
-**File transfers must be enabled with `--sync-files` on every node that should send, receive, or relay them.** Images and text are enabled by default; use `--no-images` to turn off image synchronization. Directories, symlinks, folders, virtual clipboard files, huge files, and file lists beyond the limits are not transferred. Original files are never deleted, and received files are never executed.
+**Tray mode enables file copy/paste and file receiving by default**, including the Windows double-click launcher. CLI `peer`, `serve`, and `connect` modes require `--sync-files` on nodes that send, receive, or relay files. Images and text are enabled by default; use `--no-images` to turn off image synchronization. Directories, symlinks, folders, virtual clipboard files, huge files, and file lists beyond the limits are not transferred. Original files are never deleted, and received files are never executed.
 
 ### Download prebuilt binaries (public)
 
@@ -56,20 +57,21 @@ Windows PowerShell:
 .\target\release\bleclip.exe peer --key-file .\bleclip.key --sync-files --receive-dir "$env:USERPROFILE\Downloads\BLEClip"
 ```
 
-**Use the desktop clipboard:** copy some text, copy a screenshot/image, or select files in Explorer or your Linux file manager and press Ctrl+C. Each reachable peer receives the new item. Images are put directly on the target clipboard. Copied files are stored inside `Downloads/BLEClip/<transfer UUID>/` (or the selected receive directory), and their new local paths are put on the clipboard so Ctrl+V can paste them into a file manager that supports file-list clipboard formats. Clipboard file-list support depends on the source application and desktop session.
+**Use the desktop clipboard:** copy some text, copy a screenshot/image, or select files in Explorer or your Linux file manager and press Ctrl+C. Each reachable peer receives the new item. Images are put directly on the target clipboard. Copying files sends only names and byte sizes, without uploading contents. Receivers show a desktop notification listing filenames and sizes and install a delayed file-list clipboard offer. Ctrl+V in a file manager requests the contents from the source peer, saves them inside `Downloads/BLEClip/<transfer UUID>/` (or `--receive-dir`), and supplies the downloaded local paths to the file manager. Repeated pastes reuse the downloaded files. The configured OS Downloads location is respected, with `~/Downloads` as fallback. Clipboard file-list support depends on the source application and desktop session.
 
-BLEClip only sends clipboard changes after startup. It is not a standalone file-copy dialog and does not implement drag-and-drop. If a copied file is larger than the limit, the item is skipped with an error.
+BLEClip only sends clipboard changes after startup. The tray menu also offers an explicit file picker for immediate sending; drag-and-drop is not implemented. If a copied file is larger than the limit, the item is skipped with an error.
 
 ### System tray (Windows + Linux)
 
 Use the **tray** command on each computer for a persistent system tray / notification area icon:
 
 ```bash
-bleclip tray --key-file bleclip.key --sync-files
+bleclip tray --key-file bleclip.key
 ```
 
 - **Left click** the tray icon to pause/resume clipboard sharing. **Green** = enabled; **gray with slash** = paused.
-- **Right click** for **Pause sharing / Resume sharing** and **Quit BLEClip**.
+- **Right click → Send file…** to choose up to 16 files and send immediately to reachable trusted peers. Recipients save them under Downloads/BLEClip and receive a notification; explicit sends do not replace their clipboard. On Linux install `kdialog` (KDE) or `zenity` for the picker, and `notify-send` (`libnotify` / `libnotify-bin`) for notifications. Windows uses the native file picker and notification area balloon tips.
+- **Right click** also provides **Pause sharing / Resume sharing** and **Quit BLEClip**.
 
 - The right-click menu shows **Connection: N authenticated peers** and a
   **Connected peers (N)** submenu listing peer ID prefixes and each link role
@@ -91,10 +93,10 @@ bleclip tray --key-file bleclip.key --sync-files
   are removed after the server's inactivity cleanup (typically 25–35 seconds).
   Pausing or stopping a peer clears its connection list immediately.
 - Pausing cancels advertising, scanning and active encrypted BLE connections, dropping queued/in-flight clipboard transfers. Resuming reinitializes BLE, reconnects peers, and starts monitoring again. Content already on the clipboard is not uploaded on resume; only subsequent changes are sent.
-- Text and image sync use the same settings as regular peer mode; use `--sync-files` to opt in to file transfer, `--no-images` to disable images, and `--no-advertise` when a device cannot offer the peripheral role.
+- Text and image sync use the same settings as regular peer mode; file transfer is enabled automatically in tray mode, with `--no-images` to disable images, and `--no-advertise` when a device cannot offer the peripheral role.
 - The headless `bleclip peer` command remains supported for unattended terminals/services.
 
-**Windows:** Download the public Windows ZIP and use `bleclip-tray.exe` for a GUI-subsystem launcher without a console window. Generate or securely copy `bleclip.key` **into the same directory as `bleclip-tray.exe`**, then double-click the launcher. The launcher defaults to text/image sync and accepts normal CLI parameters when invoked with arguments, for example:
+**Windows:** Download the public Windows ZIP and use `bleclip-tray.exe` for a GUI-subsystem launcher without a console window. Generate or securely copy `bleclip.key` **into the same directory as `bleclip-tray.exe`**, then double-click the launcher. The launcher defaults to text/image/file sync and accepts normal CLI parameters when invoked with arguments, for example:
 
 ```powershell
 .\bleclip-tray.exe tray --key-file .\bleclip.key --sync-files
@@ -105,6 +107,14 @@ The archive also includes `bleclip.exe` for CLI usage (including key generation)
 **Linux (KDE Plasma / Wayland or X11):** Run `bleclip tray --key-file /absolute/path/bleclip.key` from your graphical login session, or create a desktop-session autostart entry using that command with **Terminal=false**. The Linux backend uses D-Bus StatusNotifierItem (`ksni`), not GTK, so KDE Plasma works natively. Other desktop environments may require an extension or a visible StatusNotifierItem host; running without a graphical login session will not show an icon.
 
 The tray controls access to the clipboard transfer subsystem, **not OS-wide Bluetooth**; it does not disable your Bluetooth adapter or other Bluetooth applications.
+
+
+#### File offers and paste behavior
+
+- Keep the source peer connected and the original files available until paste finishes. The latest four local offers are retained for up to 30 minutes. Changed, missing, expired, or oversized files fail with a notification rather than writing mismatched data. File requests time out after 10 minutes; BLE throughput and file-manager timeouts can make large transfers impractical.
+- Delayed file lists use Windows `CF_HDROP`, X11 selection requests, or Wayland `wlr-data-control` (KDE Plasma and compatible compositors). Unsupported Wayland compositors report an error rather than downloading eagerly.
+- Contents are requested when another application asks to read the native file-list format, normally during paste. Clipboard managers or file previews can also request that format before a user presses Ctrl+V. BLEClip avoids reading its own delayed file list and supplies KDE's exclusion hint, but cannot distinguish a third-party clipboard read from paste.
+- File offers/requests extend the v3 application payload types. Update all peers to this build for on-demand file copy/paste. Text and image message formats are unchanged.
 
 ### Windows BLE peripheral-role fallback (HRESULT 0x8007013C)
 

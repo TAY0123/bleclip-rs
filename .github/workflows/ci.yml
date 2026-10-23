@@ -30,11 +30,14 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev libudev-dev libx11-dev libxcb1-dev libwayland-dev pkg-config
+          sudo apt-get install -y libdbus-1-dev libudev-dev libx11-dev libxcb1-dev libwayland-dev pkg-config xvfb xauth
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run tests
         run: cargo test --locked --all-targets
+      - name: Test delayed file paste on isolated X11
+        if: runner.os == 'Linux'
+        run: env -u WAYLAND_DISPLAY xvfb-run -a cargo test --locked native_file_paste_fetches_once_after_metadata_offer -- --ignored
       - name: Verify tray subcommand
         run: cargo run --locked -- tray --help
       - name: Compile release binary
