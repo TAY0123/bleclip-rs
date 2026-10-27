@@ -7,6 +7,7 @@ mod files;
 mod identity;
 mod message;
 mod platform;
+mod progress;
 mod router;
 mod status;
 mod transfer;

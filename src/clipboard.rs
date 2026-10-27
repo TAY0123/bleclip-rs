@@ -247,7 +247,7 @@ impl ClipboardSync {
         let result = match value {
             Observation::Text(text, _) => {
                 if text.len() > MAX_TEXT {
-                    bail_local("text exceeds 16 KiB")
+                    bail_local("text exceeds 1 MiB")
                 } else {
                     Update::text(self_id, text)
                 }
@@ -270,6 +270,7 @@ impl ClipboardSync {
             return Ok(false);
         }
         match update.kind {
+            Kind::CompressedText => bail!("compressed text must be decoded before applying"),
             Kind::Text => {
                 let value = std::str::from_utf8(&update.bytes)?;
                 let hash = signature(b"text-v3", value.as_bytes());

@@ -322,6 +322,8 @@ pub async fn run(
                                         // An authenticated identity, not a raw BLE write, makes
                                         // a peer visible in the tray's connection list.
                                         if let Some(id) = current_id {
+                                            peer.sender.set_progress(connections.transfers.reporter(id, crate::progress::Direction::Sending));
+                                            peer.receiver.set_progress(connections.transfers.reporter(id, crate::progress::Direction::Receiving));
                                             connections.connected(LinkRole::Inbound, request.client.clone(), id);
                                         } else {
                                             connections.disconnected(LinkRole::Inbound, &request.client);

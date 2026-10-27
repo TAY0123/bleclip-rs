@@ -8,10 +8,12 @@ BLEClip is a **serverless Bluetooth Low Energy** Rust app (CLI or system tray) t
 
 | Content | Source | Remote action | Maximum per clipboard event |
 | --- | --- | --- | --- |
-| Text | New copied text | Set clipboard text | 16 KiB UTF-8 |
+| Text | New copied text | Set clipboard text | 1 MiB UTF-8 |
 | Image | New copied bitmap/screenshot | Transfer lossless PNG, set remote clipboard image | 4 MiB *compressed*, maximum 8 million pixels |
 | File list | Copy 1–16 regular files in Windows Explorer / Linux file manager | Announce names/sizes; download on paste and expose local file paths | 8 MiB total, 16 files |
 | Send file… | Right-click tray menu, choose files | Download immediately into Downloads/BLEClip | 8 MiB total, 16 files |
+
+Text larger than 16 KiB is compressed for transfer. Update all receiving and relay peers to support these transfers; older builds cannot decode compressed text.
 
 **Tray mode enables file copy/paste and file receiving by default**, including the Windows double-click launcher. CLI `peer`, `serve`, and `connect` modes require `--sync-files` on nodes that send, receive, or relay files. Images and text are enabled by default; use `--no-images` to turn off image synchronization. Directories, symlinks, folders, virtual clipboard files, huge files, and file lists beyond the limits are not transferred. Original files are never deleted, and received files are never executed.
 
@@ -72,6 +74,8 @@ bleclip tray --key-file bleclip.key
 - **Left click** the tray icon to pause/resume clipboard sharing. **Green** = enabled; **gray with slash** = paused.
 - **Right click → Send file…** to choose up to 16 files and send immediately to reachable trusted peers. Recipients save them under Downloads/BLEClip and receive a notification; explicit sends do not replace their clipboard. On Linux install `kdialog` (KDE) or `zenity` for the picker, and `notify-send` (`libnotify` / `libnotify-bin`) for notifications. Windows uses the native file picker and notification area balloon tips.
 - **Right click** also provides **Pause sharing / Resume sharing** and **Quit BLEClip**.
+
+- **Transfers (N active)** shows live sending/receiving progress for file and image payloads: peer ID, percentage, transferred/total bytes, retries, and completion/failure status. Updates are throttled to four per second per transfer. Sending remains below 100% until the peer acknowledges receipt; receiving reaches 100% after payload integrity validation. The menu retains the latest eight completed or failed transfers. Pausing or disconnecting marks unfinished transfers as interrupted. Byte counts cover the transfer payload, including its bundle headers.
 
 - The right-click menu shows **Connection: N authenticated peers** and a
   **Connected peers (N)** submenu listing peer ID prefixes and each link role

@@ -134,6 +134,7 @@ async fn run_authenticated(
         remote_id,
         from_peers,
         to_peers,
+        Arc::clone(&connections.transfers),
     )
     .await;
     active_nodes.lock().await.remove(&remote_id);
@@ -149,10 +150,13 @@ async fn connected_loop(
     remote_id: Uuid,
     from_peers: mpsc::Sender<Update>,
     to_peers: broadcast::Sender<Update>,
+    transfers: Arc<crate::progress::Transfers>,
 ) -> Result<()> {
     let mut updates = to_peers.subscribe();
     let mut incoming = Incoming::default();
     let mut outgoing = Outgoing::default();
+    incoming.set_progress(transfers.reporter(remote_id, crate::progress::Direction::Receiving));
+    outgoing.set_progress(transfers.reporter(remote_id, crate::progress::Direction::Sending));
     let mut pending_ack = std::collections::VecDeque::<Uuid>::new();
     let mut poll = interval(Duration::from_millis(15));
     let mut transmit = interval(Duration::from_millis(15));

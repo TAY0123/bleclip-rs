@@ -6,10 +6,13 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub const MAX_HOPS: u8 = 8;
-pub const MAX_TEXT: usize = 16 * 1024;
+pub const MAX_TEXT: usize = 1024 * 1024;
+pub const COMPRESS_TEXT_ABOVE: usize = 16 * 1024;
+pub const MAX_COMPRESSED_TEXT: usize = 2 * MAX_TEXT;
 pub const MAX_PNG: usize = 4 * 1024 * 1024;
 pub const MAX_FILES: usize = 8 * 1024 * 1024;
 pub const CHUNK_SIZE: usize = 1024;
+const MAX_FILE_CONTROL: usize = 16 * 1024;
 const IDENTITY: u8 = 0x10;
 const START: u8 = 0x20;
 const CHUNK: u8 = 0x21;
@@ -26,6 +29,7 @@ pub enum Kind {
     FileRequest = 5,
     FileResponse = 6,
     FileError = 7,
+    CompressedText = 8,
 }
 impl Kind {
     pub fn from_byte(byte: u8) -> Result<Self> {
@@ -37,15 +41,17 @@ impl Kind {
             5 => Ok(Self::FileRequest),
             6 => Ok(Self::FileResponse),
             7 => Ok(Self::FileError),
+            8 => Ok(Self::CompressedText),
             _ => bail!("unknown payload type"),
         }
     }
     pub fn limit(self) -> usize {
         match self {
             Self::Text => MAX_TEXT,
+            Self::CompressedText => MAX_COMPRESSED_TEXT,
             Self::Png => MAX_PNG,
             Self::Files => MAX_FILES,
-            Self::FileOffer | Self::FileError => MAX_TEXT,
+            Self::FileOffer | Self::FileError => MAX_FILE_CONTROL,
             Self::FileRequest => 32,
             Self::FileResponse => MAX_FILES + 16,
         }
@@ -241,6 +247,17 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn text_limit_is_one_mib_of_utf8() {
+        let origin = Uuid::new_v4();
+        let update = Update::text(origin, "é".repeat(MAX_TEXT / 2)).unwrap();
+        assert_eq!(update.bytes.len(), 1024 * 1024);
+        assert!(Header::for_update(&update).validate().is_ok());
+        assert!(Update::text(origin, "a".repeat(MAX_TEXT + 1)).is_err());
+        let mut header = Header::for_update(&update);
+        header.size += 1;
+        assert!(header.validate().is_err());
+    }
     #[test]
     fn file_control_types_roundtrip_and_reject_invalid_identifiers() {
         let origin = Uuid::new_v4();

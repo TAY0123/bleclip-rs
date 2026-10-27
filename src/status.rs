@@ -73,6 +73,7 @@ impl State {
 /// All data is guarded by a short standard mutex because native tray events run
 /// on the UI thread rather than the Tokio runtime.
 pub(crate) struct Connections {
+    pub transfers: Arc<crate::progress::Transfers>,
     state: Mutex<State>,
     sender: watch::Sender<ConnectionSnapshot>,
 }
@@ -81,6 +82,7 @@ impl Connections {
     pub fn new() -> Arc<Self> {
         let (sender, _) = watch::channel(ConnectionSnapshot::default());
         Arc::new(Self {
+            transfers: crate::progress::Transfers::new(),
             state: Mutex::new(State::default()),
             sender,
         })

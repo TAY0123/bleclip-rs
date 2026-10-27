@@ -204,6 +204,103 @@ fn refresh_connections(
     Ok(())
 }
 
+fn refresh_transfers(
+    submenu: &Submenu,
+    rows: &mut Vec<MenuItem>,
+    transfers: &[crate::progress::TransferView],
+) -> Result<()> {
+    let active = transfers.iter().filter(|t| t.phase.active()).count();
+    submenu.set_text(format!("Transfers ({active} active)"));
+    let mut labels: Vec<_> = transfers.iter().take(12).map(|t| t.label()).collect();
+    if labels.is_empty() {
+        labels.push("No active or recent transfers".into());
+    }
+    if transfers.len() > 12 {
+        labels.push(format!("… and {} more", transfers.len() - 12));
+    }
+    // Keep native items in place while a context menu is open; only update text.
+    while rows.len() > labels.len() {
+        if let Some(item) = rows.pop() {
+            submenu.remove(&item)?;
+        }
+    }
+    for (index, label) in labels.into_iter().enumerate() {
+        if let Some(item) = rows.get(index) {
+            item.set_text(label);
+        } else {
+            let item = MenuItem::new(label, false, None);
+            submenu.append(&item)?;
+            rows.push(item);
+        }
+    }
+    Ok(())
+}
+
+// TrackPopupMenu runs a nested Windows message loop while the context menu is
+// open. A native timer continues refreshing rows during that loop.
+#[cfg(windows)]
+struct NativeTransferState {
+    submenu: Submenu,
+    rows: Vec<MenuItem>,
+    transfers: watch::Receiver<Vec<crate::progress::TransferView>>,
+}
+#[cfg(windows)]
+thread_local! {
+    static TRANSFER_MENU: std::cell::RefCell<Option<NativeTransferState>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(windows)]
+unsafe extern "system" fn refresh_transfer_timer(
+    _: windows_sys::Win32::Foundation::HWND,
+    _: u32,
+    _: usize,
+    _: u32,
+) {
+    TRANSFER_MENU.with(|slot| {
+        let Ok(mut slot) = slot.try_borrow_mut() else {
+            return;
+        };
+        if let Some(state) = slot.as_mut() {
+            if state.transfers.has_changed().unwrap_or(false) {
+                let snapshot = state.transfers.borrow_and_update().clone();
+                if let Err(err) = refresh_transfers(&state.submenu, &mut state.rows, &snapshot) {
+                    eprintln!("Transfer menu refresh failed: {err:#}");
+                }
+            }
+        }
+    });
+}
+#[cfg(windows)]
+struct NativeProgressTimer(usize);
+#[cfg(windows)]
+impl NativeProgressTimer {
+    fn new(
+        submenu: Submenu,
+        rows: Vec<MenuItem>,
+        transfers: watch::Receiver<Vec<crate::progress::TransferView>>,
+    ) -> Result<Self> {
+        use windows_sys::Win32::UI::WindowsAndMessaging::SetTimer;
+        let id = unsafe { SetTimer(std::ptr::null_mut(), 0, 250, Some(refresh_transfer_timer)) };
+        anyhow::ensure!(id != 0, "cannot start transfer menu timer");
+        TRANSFER_MENU.with(|slot| {
+            *slot.borrow_mut() = Some(NativeTransferState {
+                submenu,
+                rows,
+                transfers,
+            })
+        });
+        Ok(Self(id))
+    }
+}
+#[cfg(windows)]
+impl Drop for NativeProgressTimer {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::KillTimer(std::ptr::null_mut(), self.0);
+        }
+        TRANSFER_MENU.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
 async fn worker(
     config: PeerOptions,
     mut control: watch::Receiver<TrayState>,
@@ -251,6 +348,9 @@ pub(crate) fn run(mut config: PeerOptions) -> Result<()> {
     let scan_item = MenuItem::new("Discovery: startup + every 15 seconds", false, None);
     let peers_submenu = Submenu::new("Connected peers (0)", true);
     let mut rows: Vec<MenuItem> = Vec::new();
+    let transfers_submenu = Submenu::new("Transfers (0 active)", true);
+    let mut transfer_rows: Vec<MenuItem> = Vec::new();
+    refresh_transfers(&transfers_submenu, &mut transfer_rows, &[])?;
     let toggle_menu = MenuItem::new("Pause sharing", true, None);
     let send_file = MenuItem::new("Send file…", true, None);
     menu.append(&send_file)?;
@@ -258,6 +358,7 @@ pub(crate) fn run(mut config: PeerOptions) -> Result<()> {
     menu.append(&connection_item)?;
     menu.append(&scan_item)?;
     menu.append(&peers_submenu)?;
+    menu.append(&transfers_submenu)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&toggle_menu)?;
     menu.append(&PredefinedMenuItem::separator())?;
@@ -274,6 +375,12 @@ pub(crate) fn run(mut config: PeerOptions) -> Result<()> {
     let tray_id = tray.id().clone();
     let connections = Connections::new();
     let snapshots = connections.subscribe();
+    let transfers = connections.transfers.subscribe();
+    #[cfg(windows)]
+    let _progress_timer =
+        NativeProgressTimer::new(transfers_submenu.clone(), transfer_rows, transfers)?;
+    #[cfg(not(windows))]
+    let mut transfers = transfers;
     let (control_tx, control_rx) = watch::channel(TrayState {
         enabled: true,
         quit: false,
@@ -347,6 +454,11 @@ pub(crate) fn run(mut config: PeerOptions) -> Result<()> {
                     &current.1,
                 )?;
                 shown = Some(current);
+            }
+            #[cfg(not(windows))]
+            if transfers.has_changed().unwrap_or(false) {
+                let snapshot = transfers.borrow_and_update().clone();
+                refresh_transfers(&transfers_submenu, &mut transfer_rows, &snapshot)?;
             }
             thread::sleep(Duration::from_millis(70));
         }
