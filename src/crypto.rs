@@ -6,9 +6,10 @@
 //! on a new connection. Replay of a nonce in an active session is rejected.
 
 use crate::wire::MAX_FRAME;
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload}, XChaCha20Poly1305, XNonce,
+    aead::{Aead, KeyInit, Payload},
+    XChaCha20Poly1305, XNonce,
 };
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -52,26 +53,81 @@ fn verify(psk: &Psk, domain: &[u8], a: &[u8], b: &[u8], provided: &[u8]) -> Resu
 pub struct Initiator {
     secret: EphemeralSecret,
     public: [u8; 32],
+    domain: Domain,
+}
+
+#[derive(Clone, Copy)]
+enum Domain {
+    Gatt,
+    L2cap,
+}
+impl Domain {
+    fn client(self) -> &'static [u8] {
+        match self {
+            Self::Gatt => b"bleclip/v3/client",
+            Self::L2cap => b"bleclip/l2cap/v1/client",
+        }
+    }
+    fn server(self) -> &'static [u8] {
+        match self {
+            Self::Gatt => b"bleclip/v3/server",
+            Self::L2cap => b"bleclip/l2cap/v1/server",
+        }
+    }
+    fn finish(self) -> &'static [u8] {
+        match self {
+            Self::Gatt => b"bleclip/v3/finish",
+            Self::L2cap => b"bleclip/l2cap/v1/finish",
+        }
+    }
+    fn salt(self) -> &'static [u8] {
+        match self {
+            Self::Gatt => b"bleclip/v3/salt",
+            Self::L2cap => b"bleclip/l2cap/v1/salt",
+        }
+    }
 }
 
 impl Initiator {
     pub fn start(psk: &Psk) -> (Self, Vec<u8>) {
+        Self::start_in(psk, Domain::Gatt)
+    }
+    pub fn start_l2cap(psk: &Psk) -> (Self, Vec<u8>) {
+        Self::start_in(psk, Domain::L2cap)
+    }
+    fn start_in(psk: &Psk, domain: Domain) -> (Self, Vec<u8>) {
         let secret = EphemeralSecret::random_from_rng(OsRng);
         let public = *PublicKey::from(&secret).as_bytes();
         let mut hello = Vec::with_capacity(HELLO_SIZE);
         hello.push(HELLO_CLIENT);
         hello.extend_from_slice(&public);
-        hello.extend_from_slice(&mac(psk, b"bleclip/v3/client", &public, &[]));
-        (Self { secret, public }, hello)
+        hello.extend_from_slice(&mac(psk, domain.client(), &public, &[]));
+        (
+            Self {
+                secret,
+                public,
+                domain,
+            },
+            hello,
+        )
     }
 
     pub fn finish(self, psk: &Psk, reply: &[u8]) -> Result<(Session, Vec<u8>)> {
-        ensure!(reply.len() == HELLO_SIZE && reply[0] == HELLO_SERVER, "invalid server hello");
+        ensure!(
+            reply.len() == HELLO_SIZE && reply[0] == HELLO_SERVER,
+            "invalid server hello"
+        );
         let remote: [u8; 32] = reply[1..33].try_into()?;
-        verify(psk, b"bleclip/v3/server", &self.public, &remote, &reply[33..])?;
-        let session = derive(psk, self.secret, &self.public, &remote, true)?;
+        verify(
+            psk,
+            self.domain.server(),
+            &self.public,
+            &remote,
+            &reply[33..],
+        )?;
+        let session = derive(psk, self.secret, &self.public, &remote, true, self.domain)?;
         let mut finish = vec![HELLO_FINISH];
-        finish.extend_from_slice(&mac(psk, b"bleclip/v3/finish", &self.public, &remote));
+        finish.extend_from_slice(&mac(psk, self.domain.finish(), &self.public, &remote));
         Ok((session, finish))
     }
 }
@@ -82,29 +138,56 @@ pub struct PendingServer {
     session: Session,
     client_public: [u8; 32],
     server_public: [u8; 32],
+    domain: Domain,
 }
 
 impl PendingServer {
     pub fn finish(self, psk: &Psk, packet: &[u8]) -> Result<Session> {
-        ensure!(packet.len() == 33 && packet[0] == HELLO_FINISH,
-            "invalid client finished message");
-        verify(psk, b"bleclip/v3/finish", &self.client_public, &self.server_public, &packet[1..])?;
+        ensure!(
+            packet.len() == 33 && packet[0] == HELLO_FINISH,
+            "invalid client finished message"
+        );
+        verify(
+            psk,
+            self.domain.finish(),
+            &self.client_public,
+            &self.server_public,
+            &packet[1..],
+        )?;
         Ok(self.session)
     }
 }
 
 pub fn accept(psk: &Psk, hello: &[u8]) -> Result<(PendingServer, Vec<u8>)> {
-    ensure!(hello.len() == HELLO_SIZE && hello[0] == HELLO_CLIENT, "invalid client hello");
+    accept_in(psk, hello, Domain::Gatt)
+}
+#[cfg(any(target_os = "linux", test))]
+pub fn accept_l2cap(psk: &Psk, hello: &[u8]) -> Result<(PendingServer, Vec<u8>)> {
+    accept_in(psk, hello, Domain::L2cap)
+}
+fn accept_in(psk: &Psk, hello: &[u8], domain: Domain) -> Result<(PendingServer, Vec<u8>)> {
+    ensure!(
+        hello.len() == HELLO_SIZE && hello[0] == HELLO_CLIENT,
+        "invalid client hello"
+    );
     let client_pub: [u8; 32] = hello[1..33].try_into()?;
-    verify(psk, b"bleclip/v3/client", &client_pub, &[], &hello[33..])?;
+    verify(psk, domain.client(), &client_pub, &[], &hello[33..])?;
     let secret = EphemeralSecret::random_from_rng(OsRng);
     let server_pub = *PublicKey::from(&secret).as_bytes();
-    let session = derive(psk, secret, &client_pub, &server_pub, false)?;
+    let session = derive(psk, secret, &client_pub, &server_pub, false, domain)?;
     let mut response = Vec::with_capacity(HELLO_SIZE);
     response.push(HELLO_SERVER);
     response.extend_from_slice(&server_pub);
-    response.extend_from_slice(&mac(psk, b"bleclip/v3/server", &client_pub, &server_pub));
-    Ok((PendingServer { session, client_public: client_pub, server_public: server_pub }, response))
+    response.extend_from_slice(&mac(psk, domain.server(), &client_pub, &server_pub));
+    Ok((
+        PendingServer {
+            session,
+            client_public: client_pub,
+            server_public: server_pub,
+            domain,
+        },
+        response,
+    ))
 }
 
 fn derive(
@@ -113,13 +196,21 @@ fn derive(
     client_public: &[u8; 32],
     server_public: &[u8; 32],
     initiator: bool,
+    domain: Domain,
 ) -> Result<Session> {
-    let their_pub = if initiator { server_public } else { client_public };
+    let their_pub = if initiator {
+        server_public
+    } else {
+        client_public
+    };
     let shared = private.diffie_hellman(&PublicKey::from(*their_pub));
-    ensure!(!shared.as_bytes().iter().all(|&b| b == 0), "invalid ephemeral public key");
+    ensure!(
+        !shared.as_bytes().iter().all(|&b| b == 0),
+        "invalid ephemeral public key"
+    );
 
     let mut hash = Sha256::new();
-    hash.update(b"bleclip/v3/salt");
+    hash.update(domain.salt());
     hash.update(client_public);
     hash.update(server_public);
     let salt = hash.finalize();
@@ -157,12 +248,21 @@ pub struct Session {
 impl Session {
     /// Encrypt a typed binary application payload (identity or clipboard update).
     pub fn seal(&self, payload: &[u8]) -> Result<Vec<u8>> {
-        ensure!(payload.len() + 1 + 24 + 16 <= MAX_FRAME, "payload too large");
+        ensure!(
+            payload.len() + 1 + 24 + 16 <= MAX_FRAME,
+            "payload too large"
+        );
         let mut nonce = [0u8; 24];
         OsRng.fill_bytes(&mut nonce);
         let encrypted = self
             .send_cipher
-            .encrypt(XNonce::from_slice(&nonce), Payload { msg: payload, aad: ASSOCIATED_DATA })
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: payload,
+                    aad: ASSOCIATED_DATA,
+                },
+            )
             .map_err(|_| anyhow!("encryption failed"))?;
         let mut packet = Vec::with_capacity(1 + nonce.len() + encrypted.len());
         packet.push(ENCRYPTED);
@@ -172,15 +272,27 @@ impl Session {
     }
 
     pub fn open(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
-        ensure!(packet.len() >= 1 + 24 + 16 && packet[0] == ENCRYPTED,
-            "invalid encrypted protocol packet");
-        ensure!(packet.len() <= MAX_FRAME, "encrypted payload exceeds size limit");
+        ensure!(
+            packet.len() >= 1 + 24 + 16 && packet[0] == ENCRYPTED,
+            "invalid encrypted protocol packet"
+        );
+        ensure!(
+            packet.len() <= MAX_FRAME,
+            "encrypted payload exceeds size limit"
+        );
         let nonce: [u8; 24] = packet[1..25].try_into()?;
         if self.seen.contains(&nonce) {
             bail!("replayed encrypted protocol packet");
         }
-        let plaintext = self.recv_cipher
-            .decrypt(XNonce::from_slice(&nonce), Payload { msg: &packet[25..], aad: ASSOCIATED_DATA })
+        let plaintext = self
+            .recv_cipher
+            .decrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &packet[25..],
+                    aad: ASSOCIATED_DATA,
+                },
+            )
             .map_err(|_| anyhow!("authentication/decryption failed"))?;
         self.seen.push_back(nonce);
         if self.seen.len() > RECENT_NONCES {
@@ -195,6 +307,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn l2cap_and_gatt_handshakes_cannot_be_reused_across_transports() {
+        let psk = [17; 32];
+        let (_, gatt) = Initiator::start(&psk);
+        let (_, l2cap) = Initiator::start_l2cap(&psk);
+        assert!(accept_l2cap(&psk, &gatt).is_err());
+        assert!(accept(&psk, &l2cap).is_err());
+    }
+
+    #[test]
     fn mutually_authenticated_bidirectional_exchange() {
         let psk: Psk = [73; 32];
         let (handshake, hello) = Initiator::start(&psk);
@@ -202,9 +323,18 @@ mod tests {
         let (mut client, finish) = handshake.finish(&psk, &reply).unwrap();
         let mut server = pending.finish(&psk, &finish).unwrap();
         let packet = client.seal("Hello from Windows 🖥".as_bytes()).unwrap();
-        assert_eq!(server.open(&packet).unwrap().as_slice(), "Hello from Windows 🖥".as_bytes());
+        assert_eq!(
+            server.open(&packet).unwrap().as_slice(),
+            "Hello from Windows 🖥".as_bytes()
+        );
         assert!(server.open(&packet).is_err(), "replay must be rejected");
-        assert_eq!(client.open(&server.seal(b"Hello from Linux").unwrap()).unwrap().as_slice(), &b"Hello from Linux"[..]);
+        assert_eq!(
+            client
+                .open(&server.seal(b"Hello from Linux").unwrap())
+                .unwrap()
+                .as_slice(),
+            &b"Hello from Linux"[..]
+        );
     }
 
     #[test]

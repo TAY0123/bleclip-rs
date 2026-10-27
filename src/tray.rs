@@ -539,6 +539,7 @@ mod tests {
             total: 100,
             phase: Phase::Transferring,
             attempt: 1,
+            transport: crate::progress::Transport::Gatt,
         };
         assert_eq!(transfer_summary(&[]), "Transfer: idle");
         assert!(transfer_summary(&[transfer.clone()]).contains("Sending text"));

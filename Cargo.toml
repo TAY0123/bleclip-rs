@@ -43,6 +43,7 @@ wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 libc = "0.2"
 percent-encoding = "2"
+bluer = { version = "0.17.4", features = ["bluetoothd", "l2cap"] }
 
 # The native Win32 tray uses a message pump (no GTK or Tauri dependency).
 [target.'cfg(windows)'.dependencies]

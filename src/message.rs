@@ -6,11 +6,11 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub const MAX_HOPS: u8 = 8;
-pub const MAX_TEXT: usize = 1024 * 1024;
+pub const MAX_TEXT: usize = 8 * 1024 * 1024;
 pub const COMPRESS_TEXT_ABOVE: usize = 16 * 1024;
 pub const MAX_COMPRESSED_TEXT: usize = 2 * MAX_TEXT;
 pub const MAX_PNG: usize = 4 * 1024 * 1024;
-pub const MAX_FILES: usize = 8 * 1024 * 1024;
+pub const MAX_FILES: usize = 64 * 1024 * 1024;
 pub const CHUNK_SIZE: usize = 1024;
 const MAX_FILE_CONTROL: usize = 16 * 1024;
 const IDENTITY: u8 = 0x10;
@@ -248,13 +248,22 @@ impl Message {
 mod tests {
     use super::*;
     #[test]
-    fn text_limit_is_one_mib_of_utf8() {
+    fn text_limit_is_eight_mib_of_utf8() {
         let origin = Uuid::new_v4();
         let update = Update::text(origin, "é".repeat(MAX_TEXT / 2)).unwrap();
-        assert_eq!(update.bytes.len(), 1024 * 1024);
+        assert_eq!(update.bytes.len(), 8 * 1024 * 1024);
         assert!(Header::for_update(&update).validate().is_ok());
         assert!(Update::text(origin, "a".repeat(MAX_TEXT + 1)).is_err());
         let mut header = Header::for_update(&update);
+        header.size += 1;
+        assert!(header.validate().is_err());
+    }
+    #[test]
+    fn file_header_accepts_sixty_four_mib_and_rejects_more() {
+        let update = Update::new(Uuid::new_v4(), Kind::Files, vec![]).unwrap();
+        let mut header = Header::for_update(&update);
+        header.size = MAX_FILES as u32;
+        assert!(header.validate().is_ok());
         header.size += 1;
         assert!(header.validate().is_err());
     }

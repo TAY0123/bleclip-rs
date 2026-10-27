@@ -282,7 +282,7 @@ pub fn validate_metadata(entries: &[FileMetadata]) -> Result<()> {
             .checked_add(entry.size)
             .and_then(|n| n.checked_add(entry.name.len() as u64 + 6))
             .context("file size overflow")?;
-        ensure!(total <= MAX_FILES as u64, "file bundle exceeds 8 MiB");
+        ensure!(total <= MAX_FILES as u64, "file bundle exceeds 64 MiB");
     }
     Ok(())
 }

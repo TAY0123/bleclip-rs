@@ -2,7 +2,10 @@
 //! multiple independently authenticated central connections. Each central has
 //! its own handshake, nonce state, framing decoder and bounded transfer queues.
 
-use super::{READ_ID, SERVICE_ID, WRITE_ID};
+use super::{
+    bulk::{self, Bulk, BulkSender, EndpointLease},
+    BULK_ID, READ_ID, SERVICE_ID, WRITE_ID,
+};
 use crate::{
     crypto::{self, PendingServer, Psk, Session},
     message::{Message, Update},
@@ -10,7 +13,7 @@ use crate::{
     transfer::{Incoming, Outgoing},
     wire::{self, Decoder},
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use ble_peripheral_rust::{
     gatt::{
         characteristic::Characteristic,
@@ -50,6 +53,10 @@ struct Peer {
     receipts: VecDeque<Uuid>,
     state: PeerState,
     last_activity: Instant,
+    bulk_rx: Decoder,
+    bulk_tx: VecDeque<u8>,
+    bulk_sender: Option<BulkSender>,
+    bulk_lease: Option<EndpointLease>,
 }
 
 impl Peer {
@@ -62,6 +69,10 @@ impl Peer {
             receipts: VecDeque::new(),
             state: PeerState::Unauthenticated,
             last_activity: Instant::now(),
+            bulk_rx: Decoder::default(),
+            bulk_tx: VecDeque::new(),
+            bulk_sender: None,
+            bulk_lease: None,
         }
     }
 
@@ -81,6 +92,10 @@ impl Peer {
             self.sender = Outgoing::default();
             self.receiver = Incoming::default();
             self.receipts.clear();
+            self.bulk_sender = None;
+            self.bulk_lease = None;
+            self.bulk_rx = Decoder::default();
+            self.bulk_tx.clear();
             wire::queue_frame(&mut self.tx, &reply)?;
             self.state = PeerState::WaitingForFinish(pending);
             return Ok(None);
@@ -147,6 +162,36 @@ impl Peer {
         Ok(())
     }
 
+    fn on_bulk(&mut self, bulk: &Arc<Bulk>, bytes: &[u8]) -> Result<()> {
+        let PeerState::Authenticated {
+            session,
+            remote_id: Some(remote),
+        } = &mut self.state
+        else {
+            bail!("bulk capability before GATT authentication");
+        };
+        ensure!(
+            self.bulk_sender.is_none(),
+            "bulk capability already negotiated"
+        );
+        let endpoint = bulk::decode_endpoint(&session.open(bytes)?)?;
+        let lease = bulk.authorize(*remote);
+        let reply = session.seal(&bulk::encode_endpoint(
+            lease.as_ref().map(|lease| lease.endpoint()),
+        ))?;
+        wire::queue_frame(&mut self.bulk_tx, &reply)?;
+        self.bulk_lease = lease;
+        self.bulk_sender = Some(BulkSender::new(bulk.clone(), *remote, endpoint));
+        Ok(())
+    }
+
+    fn bulk_write(&mut self, bulk: &Arc<Bulk>, value: &[u8]) -> Result<()> {
+        for packet in self.bulk_rx.push(value)? {
+            self.on_bulk(bulk, &packet)?;
+        }
+        Ok(())
+    }
+
     /// Produce only one bounded encrypted transfer fragment when polled.
     fn refill(&mut self) -> Result<()> {
         if !self.tx.is_empty() {
@@ -160,6 +205,12 @@ impl Peer {
         {
             let message = if let Some(id) = self.receipts.pop_front() {
                 Some(Message::Ack(id))
+            } else if self
+                .bulk_sender
+                .as_mut()
+                .is_some_and(|sender| sender.step(&mut self.sender))
+            {
+                None
             } else {
                 self.sender.next(Instant::now())
             };
@@ -179,6 +230,7 @@ pub async fn run(
     from_peers: mpsc::Sender<Update>,
     to_peers: broadcast::Sender<Update>,
     connections: Arc<Connections>,
+    bulk: Arc<Bulk>,
 ) -> Result<()> {
     // On task cancellation, remove stale inbound tray entries even if the BLE
     // peripheral SDK does not emit a per-client disconnect event.
@@ -197,7 +249,7 @@ pub async fn run(
     .await
     .context("Bluetooth peripheral did not power on")??;
 
-    let service = Service {
+    let mut service = Service {
         uuid: SERVICE_ID,
         primary: true,
         characteristics: vec![
@@ -217,6 +269,18 @@ pub async fn run(
             },
         ],
     };
+    if bulk.available() {
+        service.characteristics.push(Characteristic {
+            uuid: BULK_ID,
+            properties: vec![CharacteristicProperty::Read, CharacteristicProperty::Write],
+            permissions: vec![
+                AttributePermission::Readable,
+                AttributePermission::Writeable,
+            ],
+            value: None,
+            descriptors: vec![],
+        });
+    }
     peripheral
         .add_service(&service)
         .await
@@ -266,21 +330,39 @@ pub async fn run(
                         }
                         PeripheralEvent::CharacteristicSubscriptionUpdate { .. } => {}
                         PeripheralEvent::ReadRequest { request, offset, responder } => {
-                            let answer = if request.service != SERVICE_ID || request.characteristic != READ_ID {
+                            let answer = if request.service != SERVICE_ID || !matches!(request.characteristic, READ_ID | BULK_ID) {
                                 ReadRequestResponse { value: vec![], response: RequestResponse::InvalidHandle }
                             } else if offset != 0 {
                                 ReadRequestResponse { value: vec![], response: RequestResponse::InvalidOffset }
                             } else {
                                 let value = if let Some(p) = peers.get_mut(&request.client) {
                                     p.last_activity = Instant::now();
-                                    if let Err(error) = p.refill() { eprintln!("Read transfer refill failed: {error:#}"); }
-                                    wire::pop_chunk(&mut p.tx)
+                                    if request.characteristic == BULK_ID {
+                                        wire::pop_chunk(&mut p.bulk_tx)
+                                    } else {
+                                        if let Err(error) = p.refill() { eprintln!("Read transfer refill failed: {error:#}"); }
+                                        wire::pop_chunk(&mut p.tx)
+                                    }
                                 } else { vec![] };
                                 ReadRequestResponse { value, response: RequestResponse::Success }
                             };
                             let _ = responder.send(answer);
                         }
                         PeripheralEvent::WriteRequest { request, offset, value, responder } => {
+                            if request.service == SERVICE_ID && request.characteristic == BULK_ID {
+                                let result = if offset != 0 || value.is_empty() || value.len() > wire::ATT_CHUNK {
+                                    Err(anyhow::anyhow!("invalid bulk capability fragment"))
+                                } else if let Some(peer) = peers.get_mut(&request.client) {
+                                    peer.last_activity = Instant::now();
+                                    peer.bulk_write(&bulk, &value)
+                                } else { Err(anyhow::anyhow!("bulk capability before authentication")) };
+                                let response = if let Err(error) = result {
+                                    eprintln!("Bulk capability rejected: {error:#}; GATT remains available");
+                                    RequestResponse::UnlikelyError
+                                } else { RequestResponse::Success };
+                                let _ = responder.send(WriteRequestResponse { response });
+                                continue;
+                            }
                             let mut response = RequestResponse::Success;
                             let mut accepted = Vec::<Update>::new();
                             if request.service != SERVICE_ID || request.characteristic != WRITE_ID {
@@ -352,6 +434,68 @@ mod tests {
     use super::*;
     use crate::crypto::Initiator;
     use crate::message::Kind;
+
+    #[tokio::test]
+    async fn optional_bulk_exchange_requires_auth_and_can_decline_without_breaking_gatt() {
+        let key = [42; 32];
+        let own_id = Uuid::new_v4();
+        let remote_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(1);
+        let (bulk, _listener) =
+            Bulk::start(key, own_id, tx, crate::progress::Transfers::new(), 1, false).await;
+        let mut peer = Peer::new();
+        assert!(peer.on_bulk(&bulk, &[0; 20]).is_err());
+        let (initiator, hello) = Initiator::start(&key);
+        peer.on_message(&key, own_id, &hello).unwrap();
+        let mut decoder = Decoder::default();
+        let reply = loop {
+            let packets = decoder.push(&wire::pop_chunk(&mut peer.tx)).unwrap();
+            if let Some(packet) = packets.into_iter().next() {
+                break packet;
+            }
+        };
+        let (mut session, finish) = initiator.finish(&key, &reply).unwrap();
+        peer.on_message(&key, own_id, &finish).unwrap();
+        peer.on_message(
+            &key,
+            own_id,
+            &session
+                .seal(&Message::Identity(remote_id).encode().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let packet = session.seal(&bulk::encode_endpoint(None)).unwrap();
+        for chunk in wire::frame(&packet).unwrap().chunks(wire::ATT_CHUNK) {
+            peer.bulk_write(&bulk, chunk).unwrap();
+        }
+        let mut decoder = Decoder::default();
+        let reply = loop {
+            let packets = decoder.push(&wire::pop_chunk(&mut peer.bulk_tx)).unwrap();
+            if let Some(packet) = packets.into_iter().next() {
+                break packet;
+            }
+        };
+        assert!(bulk::decode_endpoint(&session.open(&reply).unwrap())
+            .unwrap()
+            .is_none());
+        let update = Update::text(remote_id, "GATT still works".into()).unwrap();
+        let mut outgoing = Outgoing::default();
+        outgoing.enqueue(update.clone()).unwrap();
+        let mut received = None;
+        while let Some(message) = outgoing.next(Instant::now()) {
+            if let Some(item) = peer
+                .on_message(
+                    &key,
+                    own_id,
+                    &session.seal(&message.encode().unwrap()).unwrap(),
+                )
+                .unwrap()
+            {
+                received = Some(item);
+            }
+        }
+        assert_eq!(received, Some(update));
+    }
     #[test]
     fn independent_clients_receive_encrypted_file_chunks() {
         let key = [42u8; 32];

@@ -110,6 +110,24 @@ impl Outgoing {
             self.current = None;
         }
     }
+    /// Take only a waiting update, never interrupt a partially sent GATT frame.
+    pub fn take_bulk_candidate(&mut self, threshold: usize) -> Option<Update> {
+        if self.current.is_none()
+            && self
+                .queue
+                .front()
+                .is_some_and(|u| u.bytes.len() > threshold)
+        {
+            self.queue.pop_front()
+        } else {
+            None
+        }
+    }
+    /// Retry the identical update before newer queued items after a bulk error.
+    pub fn fallback(&mut self, update: Update) {
+        assert!(self.current.is_none());
+        self.current = Some(Sending::new(update, Instant::now()));
+    }
     pub fn next(&mut self, now: Instant) -> Option<Message> {
         if self.current.is_none() {
             self.current = self
@@ -647,7 +665,7 @@ mod tests {
         )
         .unwrap();
         assert!(x.handle(Message::End(upd.id), time).is_err());
-        assert_eq!(MAX_FILES, 8 * 1024 * 1024);
+        assert_eq!(MAX_FILES, 64 * 1024 * 1024);
     }
     #[test]
     fn repeated_transfer_ack_does_not_repeat_update() {

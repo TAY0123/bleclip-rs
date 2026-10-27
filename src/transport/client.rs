@@ -1,7 +1,10 @@
 //! BLE central half of peer mode. Scans continuously and maintains multiple
 //! concurrent, independently encrypted outgoing GATT connections.
 
-use super::{READ_ID, SERVICE_ID, WRITE_ID};
+use super::{
+    bulk::{self, Bulk, BulkSender, EndpointLease},
+    BULK_ID, READ_ID, SERVICE_ID, WRITE_ID,
+};
 use crate::{
     crypto::{Initiator, Psk, Session},
     message::{Message, Update},
@@ -83,6 +86,7 @@ async fn run_authenticated(
     active_nodes: Arc<Mutex<HashSet<Uuid>>>,
     connections: Arc<Connections>,
     connecting: ConnectingGuard,
+    bulk: Arc<Bulk>,
 ) -> Result<()> {
     timeout(CONNECT_TIMEOUT, peer.discover_services())
         .await
@@ -129,6 +133,19 @@ async fn run_authenticated(
     let _link = connections.track(LinkRole::Outbound, peer.id().to_string(), remote_id);
     drop(connecting);
     println!("Outgoing encrypted BLE connection to {remote_id}");
+    // Keep updates copied during optional negotiation in the bounded bus queue.
+    let updates = to_peers.subscribe();
+    let (bulk_sender, _bulk_lease) = if let Some(ch) = chars.iter().find(|ch| ch.uuid == BULK_ID) {
+        match negotiate_bulk(peer, ch, &mut session, &bulk, remote_id).await {
+            Ok(pair) => pair,
+            Err(error) => {
+                eprintln!("L2CAP negotiation with {remote_id} failed: {error:#}; using GATT");
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
     let result = connected_loop(
         peer,
         &write_char,
@@ -137,12 +154,38 @@ async fn run_authenticated(
         &mut session,
         remote_id,
         from_peers,
-        to_peers,
+        updates,
         Arc::clone(&connections.transfers),
+        bulk_sender,
     )
     .await;
     active_nodes.lock().await.remove(&remote_id);
     result
+}
+
+async fn negotiate_bulk(
+    peer: &Peripheral,
+    ch: &Characteristic,
+    session: &mut Session,
+    bulk: &Arc<Bulk>,
+    remote: Uuid,
+) -> Result<(Option<BulkSender>, Option<EndpointLease>)> {
+    let Some(lease) = bulk.authorize(remote) else {
+        return Ok((None, None));
+    };
+    let endpoint = timeout(Duration::from_secs(8), async {
+        let packet = session.seal(&bulk::encode_endpoint(Some(lease.endpoint())))?;
+        send_packet(peer, ch, &packet).await?;
+        let mut decoder = Decoder::default();
+        let reply = next_frame(peer, ch, &mut decoder, Duration::from_secs(5)).await?;
+        bulk::decode_endpoint(&session.open(&reply)?)
+    })
+    .await
+    .context("bulk capability exchange timed out")??;
+    Ok((
+        Some(BulkSender::new(bulk.clone(), remote, endpoint)),
+        Some(lease),
+    ))
 }
 
 async fn connected_loop(
@@ -153,10 +196,10 @@ async fn connected_loop(
     session: &mut Session,
     remote_id: Uuid,
     from_peers: mpsc::Sender<Update>,
-    to_peers: broadcast::Sender<Update>,
+    mut updates: broadcast::Receiver<Update>,
     transfers: Arc<crate::progress::Transfers>,
+    mut bulk_sender: Option<BulkSender>,
 ) -> Result<()> {
-    let mut updates = to_peers.subscribe();
     let mut incoming = Incoming::default();
     let mut outgoing = Outgoing::default();
     incoming.set_progress(transfers.reporter(remote_id, crate::progress::Direction::Receiving));
@@ -190,6 +233,8 @@ async fn connected_loop(
             _ = transmit.tick() => {
                 let message = if let Some(id) = pending_ack.pop_front() {
                     Some(Message::Ack(id))
+                } else if bulk_sender.as_mut().is_some_and(|sender| sender.step(&mut outgoing)) {
+                    None
                 } else {
                     outgoing.next(Instant::now())
                 };
@@ -225,6 +270,7 @@ async fn connect_one(
     to_peers: broadcast::Sender<Update>,
     active_nodes: Arc<Mutex<HashSet<Uuid>>>,
     connections: Arc<Connections>,
+    bulk: Arc<Bulk>,
 ) -> Result<()> {
     let connecting = connections.track_connecting(peer.id().to_string());
     let connected = timeout(CONNECT_TIMEOUT, peer.is_connected())
@@ -249,6 +295,7 @@ async fn connect_one(
         active_nodes,
         connections,
         connecting,
+        bulk,
     )
     .await;
     let _ = timeout(Duration::from_secs(5), peer.disconnect()).await;
@@ -263,6 +310,7 @@ pub async fn run(
     from_peers: mpsc::Sender<Update>,
     to_peers: broadcast::Sender<Update>,
     connections: Arc<Connections>,
+    bulk: Arc<Bulk>,
 ) -> Result<()> {
     let manager = Manager::new()
         .await
@@ -322,9 +370,10 @@ pub async fn run(
                     let broadcast = to_peers.clone();
                     let nodes = active_nodes.clone();
                     let tracker = Arc::clone(&connections);
+                    let bulk = bulk.clone();
                     let candidate_id = id.clone();
                     let handle = workers.spawn(async move {
-                        let result = connect_one(candidate, psk, own_id, tx, broadcast, nodes, tracker).await;
+                        let result = connect_one(candidate, psk, own_id, tx, broadcast, nodes, tracker, bulk).await;
                         (id, result)
                     });
                     worker_ids.insert(handle.id(), candidate_id);

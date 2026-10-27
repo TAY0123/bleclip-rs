@@ -110,6 +110,9 @@ pub(crate) struct PeerOptions {
     /// Skip BLE central role (use if simultaneous scanning isn't supported).
     #[arg(long)]
     no_scan: bool,
+    /// Disable optional LE L2CAP bulk channels and use GATT for every transfer.
+    #[arg(long)]
+    no_l2cap: bool,
     /// Enable file offers and transfers (always enabled in tray mode).
     #[arg(long)]
     sync_files: bool,
@@ -171,6 +174,7 @@ pub(crate) async fn run_peer(
         max_outbound,
         no_advertise,
         no_scan,
+        no_l2cap,
         sync_files: allow_files,
         no_images,
         receive_dir,
@@ -221,6 +225,15 @@ pub(crate) async fn run_peer(
     let own_id = identity::load_or_create(&id_path)?;
     let (from_peers_tx, from_peers_rx) = mpsc::channel(256);
     let (to_peers_tx, _) = broadcast::channel(256);
+    let (bulk, _bulk_listener) = transport::bulk::Bulk::start(
+        psk,
+        own_id,
+        from_peers_tx.clone(),
+        Arc::clone(&connections.transfers),
+        max_inbound + max_outbound,
+        !no_l2cap,
+    )
+    .await;
 
     let receive_dir = match receive_dir {
         Some(path) => path,
@@ -242,6 +255,7 @@ pub(crate) async fn run_peer(
         let sender = from_peers_tx.clone();
         let name = name.clone();
         let server_connections = Arc::clone(&connections);
+        let bulk = bulk.clone();
         Some(tokio::spawn(async move {
             loop {
                 if let Err(error) = transport::server::run(
@@ -252,6 +266,7 @@ pub(crate) async fn run_peer(
                     sender.clone(),
                     updates.clone(),
                     Arc::clone(&server_connections),
+                    bulk.clone(),
                 )
                 .await
                 {
@@ -274,6 +289,7 @@ pub(crate) async fn run_peer(
         let updates = to_peers_tx.clone();
         let sender = from_peers_tx.clone();
         let client_connections = Arc::clone(&connections);
+        let bulk = bulk.clone();
         Some(tokio::spawn(async move {
             loop {
                 if let Err(error) = transport::client::run(
@@ -284,6 +300,7 @@ pub(crate) async fn run_peer(
                     sender.clone(),
                     updates.clone(),
                     Arc::clone(&client_connections),
+                    bulk.clone(),
                 )
                 .await
                 {
@@ -352,6 +369,7 @@ async fn main() -> Result<()> {
                 max_outbound: 8,
                 no_advertise: false,
                 no_scan: false,
+                no_l2cap: false,
                 sync_files: true,
                 no_images: false,
                 receive_dir: None,
@@ -403,6 +421,7 @@ async fn main() -> Result<()> {
                     max_outbound: 8,
                     no_advertise: false,
                     no_scan: true,
+                    no_l2cap: false,
                     sync_files,
                     no_images,
                     receive_dir,
@@ -430,6 +449,7 @@ async fn main() -> Result<()> {
                     max_outbound: 8,
                     no_advertise: true,
                     no_scan: false,
+                    no_l2cap: false,
                     sync_files,
                     no_images,
                     receive_dir,

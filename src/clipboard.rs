@@ -247,7 +247,7 @@ impl ClipboardSync {
         let result = match value {
             Observation::Text(text, _) => {
                 if text.len() > MAX_TEXT {
-                    bail_local("text exceeds 1 MiB")
+                    bail_local("text exceeds 8 MiB")
                 } else {
                     Update::text(self_id, text)
                 }

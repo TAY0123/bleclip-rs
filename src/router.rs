@@ -1,5 +1,5 @@
 //! Multi-peer fan-out with per-event deduplication. Each completed binary
-//! transfer is relayed as a whole (bounded at 8 MiB), not half-written files.
+//! transfer is relayed as a whole (bounded at 64 MiB), not half-written files.
 use crate::{
     clipboard::{ClipboardSync, Direction},
     message::{Kind, Update, MAX_HOPS},

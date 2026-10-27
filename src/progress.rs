@@ -15,6 +15,11 @@ pub enum Direction {
     Receiving,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Transport {
+    Gatt,
+    L2cap,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
     Transferring,
     AwaitingAck,
@@ -36,6 +41,7 @@ pub struct TransferView {
     pub total: usize,
     pub phase: Phase,
     pub attempt: u8,
+    pub transport: Transport,
 }
 impl TransferView {
     pub fn percent(&self) -> usize {
@@ -56,6 +62,10 @@ impl TransferView {
             _ => "files",
         };
         let peer = self.peer.simple().to_string();
+        let transport = match self.transport {
+            Transport::Gatt => "BLE GATT",
+            Transport::L2cap => "BLE L2CAP",
+        };
         let state = match self.phase {
             Phase::Complete => "complete".into(),
             Phase::Failed => "failed / interrupted".into(),
@@ -64,7 +74,7 @@ impl TransferView {
             Phase::Transferring => "transferring".into(),
         };
         format!(
-            "{action} {kind} · {} · {}% ({}/{}) · {state}",
+            "{action} {kind} · {transport} · {} · {}% ({}/{}) · {state}",
             &peer[..8],
             self.percent(),
             size(self.bytes),
@@ -112,6 +122,7 @@ impl Transfers {
             direction,
             last: None,
             published: Instant::now(),
+            transport: Transport::Gatt,
         }
     }
     fn publish(&self, source: Uuid, view: TransferView) {
@@ -147,8 +158,13 @@ pub struct Reporter {
     direction: Direction,
     last: Option<TransferView>,
     published: Instant,
+    transport: Transport,
 }
 impl Reporter {
+    pub fn with_transport(mut self, transport: Transport) -> Self {
+        self.transport = transport;
+        self
+    }
     pub fn update(
         &mut self,
         id: Uuid,
@@ -173,6 +189,7 @@ impl Reporter {
             total,
             phase,
             attempt,
+            transport: self.transport,
         };
         let transition = self
             .last
