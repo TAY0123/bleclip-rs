@@ -186,7 +186,7 @@ On Linux, `arboard` supports X11 and Wayland data-control when available. Some W
 3. The sender announces `{UUID, origin, hops, type, total size, SHA-256}`, then sends numbered **1,024-byte plaintext chunks**, each separately encrypted and framed over 20-byte GATT writes/reads (minimum standard ATT payload).
 4. Receiver rejects missing/out-of-order/truncated/tampered chunks and verifies the whole SHA-256 digest. After a complete transfer it sends an authenticated ACK. Sender retries up to three times if ACK is not received on an otherwise open link.
 5. A router applies the clipboard update and relays the **completed** payload to other authorized peers. Its event UUID remains constant over each hop, with up to eight hops and deduplication to stop loops. Copies are shared cheaply using `Arc<[u8]>`.
-6. Each GATT link can process one inbound and one outbound transfer at a time. Local updates queue up to four per link; later updates can be dropped on overload. `broadcast` queues are bounded.
+6. Each GATT link can process one inbound and one outbound transfer at a time. Each link retains the latest waiting clipboard item and up to four separate file-transfer messages; additional file-transfer messages can be dropped on overload. `broadcast` queues are bounded.
 
 **ACK means the peer reassembled and authenticated the bytes, not that another desktop app has pasted the item.** There is no durable store-and-forward for peers that disconnect, no transfer continuation after reconnect, and no guarantee of exactly-once file placement after process restarts. Relays decrypt and re-encrypt content because all devices with the shared group key are mutually trusted; this is *per-link* encryption, not a zero-knowledge mesh.
 

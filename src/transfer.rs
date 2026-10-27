@@ -14,7 +14,15 @@ use std::{
 };
 use uuid::Uuid;
 
+// Clipboard contents supersede earlier waiting contents, while file transfer
+// messages must retain their order and cannot be silently replaced.
 const MAX_QUEUE: usize = 4;
+fn is_clipboard(kind: Kind) -> bool {
+    matches!(
+        kind,
+        Kind::Text | Kind::CompressedText | Kind::Png | Kind::FileOffer
+    )
+}
 const ACK_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_ATTEMPTS: u8 = 3;
 const INBOUND_TIMEOUT: Duration = Duration::from_secs(180);
@@ -67,16 +75,27 @@ impl Outgoing {
         }
     }
     pub fn enqueue(&mut self, mut update: Update) -> Result<()> {
-        if self.queue.len() >= MAX_QUEUE {
-            bail!("outgoing file/image queue full; update dropped");
-        }
         update.validate()?;
+        let clipboard = is_clipboard(update.kind);
+        if !clipboard
+            && self
+                .queue
+                .iter()
+                .filter(|item| !is_clipboard(item.kind))
+                .count()
+                >= MAX_QUEUE
+        {
+            bail!("outgoing file transfer queue full; update dropped");
+        }
         if update.kind == Kind::Text && update.bytes.len() > COMPRESS_TEXT_ABOVE {
             let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
             encoder.write_all(&update.bytes)?;
             update.bytes = encoder.finish()?.into();
             update.kind = Kind::CompressedText;
             update.validate()?;
+        }
+        if clipboard {
+            self.queue.retain(|item| !is_clipboard(item.kind));
         }
         self.queue.push_back(update);
         Ok(())
@@ -354,6 +373,53 @@ impl Incoming {
 mod tests {
     use super::*;
     use crate::message::{Kind, MAX_FILES};
+    #[test]
+    fn latest_clipboard_item_survives_busy_link_without_dropping_files() {
+        let origin = Uuid::new_v4();
+        let active = Update::text(origin, "already sending".into()).unwrap();
+        let old = Update::text(origin, "old clipboard".into()).unwrap();
+        let image = Update::new(origin, Kind::Png, vec![1]).unwrap();
+        let latest = Update::text(origin, "new clipboard".into()).unwrap();
+        let files: Vec<_> = (0..MAX_QUEUE)
+            .map(|n| Update::new(origin, Kind::Files, vec![n as u8]).unwrap())
+            .collect();
+        let mut out = Outgoing::default();
+        let now = Instant::now();
+        out.enqueue(active.clone()).unwrap();
+        assert!(matches!(out.next(now), Some(Message::Start(header)) if header.id == active.id));
+        out.enqueue(old).unwrap();
+        for file in &files {
+            out.enqueue(file.clone()).unwrap();
+        }
+        out.enqueue(image).unwrap();
+        out.enqueue(latest.clone()).unwrap();
+        assert!(out
+            .enqueue(Update::new(origin, Kind::Files, vec![9]).unwrap())
+            .is_err());
+        assert_eq!(out.queue.len(), MAX_QUEUE + 1);
+        assert_eq!(
+            out.queue.iter().map(|item| item.id).collect::<Vec<_>>(),
+            files
+                .iter()
+                .map(|item| item.id)
+                .chain([latest.id])
+                .collect::<Vec<_>>()
+        );
+        while out.next(now).is_some() {}
+        out.ack(active.id);
+        assert!(matches!(out.next(now), Some(Message::Start(header)) if header.id == files[0].id));
+    }
+    #[test]
+    fn invalid_clipboard_update_does_not_replace_waiting_item() {
+        let origin = Uuid::new_v4();
+        let mut out = Outgoing::default();
+        let valid = Update::text(origin, "keep me".into()).unwrap();
+        out.enqueue(valid.clone()).unwrap();
+        let mut invalid = valid.clone();
+        invalid.bytes = vec![0xff].into();
+        assert!(out.enqueue(invalid).is_err());
+        assert_eq!(out.queue.front(), Some(&valid));
+    }
     #[test]
     fn progress_tracks_ack_retries_and_failure() {
         use crate::progress::{Direction, Phase, Transfers};
