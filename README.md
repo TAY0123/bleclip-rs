@@ -75,24 +75,22 @@ bleclip tray --key-file bleclip.key
 - **Right click → Send file…** to choose up to 16 files and send immediately to reachable trusted peers. Recipients save them under Downloads/BLEClip and receive a notification; explicit sends do not replace their clipboard. On Linux install `kdialog` (KDE) or `zenity` for the picker, and `notify-send` (`libnotify` / `libnotify-bin`) for notifications. Windows uses the native file picker and notification area balloon tips.
 - **Right click** also provides **Pause sharing / Resume sharing** and **Quit BLEClip**.
 
-- **Transfers (N active)** shows live sending/receiving progress for file and image payloads: peer ID, percentage, transferred/total bytes, retries, and completion/failure status. Updates are throttled to four per second per transfer. Sending remains below 100% until the peer acknowledges receipt; receiving reaches 100% after payload integrity validation. The menu retains the latest eight completed or failed transfers. Pausing or disconnecting marks unfinished transfers as interrupted. Byte counts cover the transfer payload, including its bundle headers.
+- The context menu shows the current transfer or the most recent result. **Transfers (N active)** lists live and recent text, file, and image transfers with peer ID, percentage, transferred/total bytes, retries, and completion/failure status. Updates are throttled to four per second per transfer. Sending remains below 100% until the peer acknowledges receipt; receiving reaches 100% after payload integrity validation. The menu retains the latest eight completed or failed transfers. Pausing or disconnecting marks unfinished transfers as interrupted. Byte counts cover the transmitted payload, including file bundle headers and compressed text.
 
 - The right-click menu shows **Connection: N authenticated peers** and a
   **Connected peers (N)** submenu listing peer ID prefixes and each link role
   (inbound, outbound, or both). A device with simultaneous inbound/outbound
   links counts as one peer. Raw discovered devices and unauthenticated pairing
   attempts are not counted as connected.
+- While connecting or authenticating, the menu shows the number of connection
+  attempts in progress; a peer is counted only after authentication succeeds.
 - With no connected peers, the menu shows **disconnected (searching)**. BLE
-  discovery starts as soon as the peer launches, then enumerates discovered
-  devices **every 15 seconds** while outgoing connection slots remain free.
-  Failed connection attempts use the same 15-second retry interval (previously
-  30 seconds). When a link ends, the peer immediately reevaluates discovery;
-  attempts against a recently failed Bluetooth address remain subject to the
-  15-second cooldown.
-- The menu explicitly reports the scan interval; a server-only peer shows
-  **incoming connections only** instead. BLE scanning remains active while
-  discovery is enabled: 15 seconds is the discovery/connection-attempt
-  interval, not a guaranteed BLE radio scan-window duration.
+  scanning starts at launch and the discovered-device cache is checked every
+  2 seconds while outgoing connection slots remain free. After a failed link,
+  that address has a 15-second retry cooldown; other devices can still connect.
+  A link ending also prompts an immediate discovery check. A server-only peer
+  shows **incoming connections only**. The check interval does not determine
+  the Bluetooth radio's scan-window duration.
 - Inbound GATT clients that disconnect without an explicit disconnect event
   are removed after the server's inactivity cleanup (typically 25–35 seconds).
   Pausing or stopping a peer clears its connection list immediately.

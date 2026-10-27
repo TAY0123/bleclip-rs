@@ -51,6 +51,7 @@ impl TransferView {
             Direction::Receiving => "Receiving",
         };
         let kind = match self.kind {
+            Kind::Text | Kind::CompressedText => "text",
             Kind::Png => "image",
             _ => "files",
         };
@@ -157,7 +158,10 @@ impl Reporter {
         phase: Phase,
         attempt: u8,
     ) {
-        if !matches!(kind, Kind::Files | Kind::FileResponse | Kind::Png) {
+        if !matches!(
+            kind,
+            Kind::Text | Kind::CompressedText | Kind::Files | Kind::FileResponse | Kind::Png
+        ) {
             return;
         }
         let view = TransferView {
@@ -223,12 +227,13 @@ mod tests {
         );
     }
     #[test]
-    fn terminal_history_is_bounded_and_text_is_excluded() {
+    fn terminal_history_is_bounded_and_text_is_included() {
         let monitor = Transfers::new();
         let view = monitor.subscribe();
         let mut reporter = monitor.reporter(Uuid::new_v4(), Direction::Sending);
         reporter.update(Uuid::new_v4(), Kind::Text, 1, 1, Phase::Complete, 1);
-        assert!(view.borrow().is_empty());
+        assert_eq!(view.borrow()[0].kind, Kind::Text);
+        assert!(view.borrow()[0].label().contains("text"));
         for _ in 0..20 {
             reporter.update(Uuid::new_v4(), Kind::Files, 1, 1, Phase::Complete, 1);
         }

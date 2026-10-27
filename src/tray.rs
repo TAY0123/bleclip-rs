@@ -133,10 +133,18 @@ fn connection_label(state: TrayState, snapshot: &ConnectionSnapshot) -> String {
     }
     if !snapshot.peers.is_empty() {
         let count = snapshot.peers.len();
+        let connecting = if snapshot.connecting > 0 {
+            format!(" (connecting {})", snapshot.connecting)
+        } else {
+            String::new()
+        };
         return format!(
-            "Connection: {count} authenticated peer{}",
-            if count == 1 { "" } else { "s" }
+            "Connection: {count} authenticated peer{}{connecting}",
+            if count == 1 { "" } else { "s" },
         );
+    }
+    if snapshot.connecting > 0 {
+        return format!("Connection: connecting ({})", snapshot.connecting);
     }
     if snapshot.scanning {
         "Connection: disconnected (searching)".to_string()
@@ -151,7 +159,7 @@ fn scan_label(state: TrayState, snapshot: &ConnectionSnapshot) -> &'static str {
     if !state.enabled || state.quit {
         "Discovery: paused"
     } else if snapshot.scanning {
-        "Discovery: startup + every 15 seconds"
+        "Discovery: checking every 2 seconds"
     } else if snapshot.advertising {
         "Discovery: incoming connections only"
     } else {
@@ -204,11 +212,29 @@ fn refresh_connections(
     Ok(())
 }
 
+fn transfer_summary(transfers: &[crate::progress::TransferView]) -> String {
+    let active = transfers.iter().filter(|t| t.phase.active()).count();
+    if let Some(transfer) = transfers.iter().find(|t| t.phase.active()) {
+        let suffix = if active > 1 {
+            format!(" (+{} more)", active - 1)
+        } else {
+            String::new()
+        };
+        format!("Transfer: {}{suffix}", transfer.label())
+    } else if let Some(transfer) = transfers.first() {
+        format!("Last transfer: {}", transfer.label())
+    } else {
+        "Transfer: idle".into()
+    }
+}
+
 fn refresh_transfers(
+    status: &MenuItem,
     submenu: &Submenu,
     rows: &mut Vec<MenuItem>,
     transfers: &[crate::progress::TransferView],
 ) -> Result<()> {
+    status.set_text(transfer_summary(transfers));
     let active = transfers.iter().filter(|t| t.phase.active()).count();
     submenu.set_text(format!("Transfers ({active} active)"));
     let mut labels: Vec<_> = transfers.iter().take(12).map(|t| t.label()).collect();
@@ -240,6 +266,7 @@ fn refresh_transfers(
 // open. A native timer continues refreshing rows during that loop.
 #[cfg(windows)]
 struct NativeTransferState {
+    status: MenuItem,
     submenu: Submenu,
     rows: Vec<MenuItem>,
     transfers: watch::Receiver<Vec<crate::progress::TransferView>>,
@@ -262,7 +289,9 @@ unsafe extern "system" fn refresh_transfer_timer(
         if let Some(state) = slot.as_mut() {
             if state.transfers.has_changed().unwrap_or(false) {
                 let snapshot = state.transfers.borrow_and_update().clone();
-                if let Err(err) = refresh_transfers(&state.submenu, &mut state.rows, &snapshot) {
+                if let Err(err) =
+                    refresh_transfers(&state.status, &state.submenu, &mut state.rows, &snapshot)
+                {
                     eprintln!("Transfer menu refresh failed: {err:#}");
                 }
             }
@@ -274,6 +303,7 @@ struct NativeProgressTimer(usize);
 #[cfg(windows)]
 impl NativeProgressTimer {
     fn new(
+        status: MenuItem,
         submenu: Submenu,
         rows: Vec<MenuItem>,
         transfers: watch::Receiver<Vec<crate::progress::TransferView>>,
@@ -283,6 +313,7 @@ impl NativeProgressTimer {
         anyhow::ensure!(id != 0, "cannot start transfer menu timer");
         TRANSFER_MENU.with(|slot| {
             *slot.borrow_mut() = Some(NativeTransferState {
+                status,
                 submenu,
                 rows,
                 transfers,
@@ -345,12 +376,18 @@ pub(crate) fn run(mut config: PeerOptions) -> Result<()> {
     config.sync_files = true;
     let menu = Menu::new();
     let connection_item = MenuItem::new("Connection: initializing BLE", false, None);
-    let scan_item = MenuItem::new("Discovery: startup + every 15 seconds", false, None);
+    let scan_item = MenuItem::new("Discovery: checking every 2 seconds", false, None);
     let peers_submenu = Submenu::new("Connected peers (0)", true);
     let mut rows: Vec<MenuItem> = Vec::new();
     let transfers_submenu = Submenu::new("Transfers (0 active)", true);
+    let transfer_status = MenuItem::new("Transfer: idle", false, None);
     let mut transfer_rows: Vec<MenuItem> = Vec::new();
-    refresh_transfers(&transfers_submenu, &mut transfer_rows, &[])?;
+    refresh_transfers(
+        &transfer_status,
+        &transfers_submenu,
+        &mut transfer_rows,
+        &[],
+    )?;
     let toggle_menu = MenuItem::new("Pause sharing", true, None);
     let send_file = MenuItem::new("Send file…", true, None);
     menu.append(&send_file)?;
@@ -358,6 +395,7 @@ pub(crate) fn run(mut config: PeerOptions) -> Result<()> {
     menu.append(&connection_item)?;
     menu.append(&scan_item)?;
     menu.append(&peers_submenu)?;
+    menu.append(&transfer_status)?;
     menu.append(&transfers_submenu)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&toggle_menu)?;
@@ -377,8 +415,12 @@ pub(crate) fn run(mut config: PeerOptions) -> Result<()> {
     let snapshots = connections.subscribe();
     let transfers = connections.transfers.subscribe();
     #[cfg(windows)]
-    let _progress_timer =
-        NativeProgressTimer::new(transfers_submenu.clone(), transfer_rows, transfers)?;
+    let _progress_timer = NativeProgressTimer::new(
+        transfer_status.clone(),
+        transfers_submenu.clone(),
+        transfer_rows,
+        transfers,
+    )?;
     #[cfg(not(windows))]
     let mut transfers = transfers;
     let (control_tx, control_rx) = watch::channel(TrayState {
@@ -458,7 +500,12 @@ pub(crate) fn run(mut config: PeerOptions) -> Result<()> {
             #[cfg(not(windows))]
             if transfers.has_changed().unwrap_or(false) {
                 let snapshot = transfers.borrow_and_update().clone();
-                refresh_transfers(&transfers_submenu, &mut transfer_rows, &snapshot)?;
+                refresh_transfers(
+                    &transfer_status,
+                    &transfers_submenu,
+                    &mut transfer_rows,
+                    &snapshot,
+                )?;
             }
             thread::sleep(Duration::from_millis(70));
         }
@@ -480,6 +527,26 @@ pub(crate) fn run(mut config: PeerOptions) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transfer_summary_shows_active_and_recent_text() {
+        use crate::progress::{Direction, Phase, TransferView};
+        let transfer = TransferView {
+            id: uuid::Uuid::new_v4(),
+            peer: uuid::Uuid::new_v4(),
+            direction: Direction::Sending,
+            kind: crate::message::Kind::CompressedText,
+            bytes: 50,
+            total: 100,
+            phase: Phase::Transferring,
+            attempt: 1,
+        };
+        assert_eq!(transfer_summary(&[]), "Transfer: idle");
+        assert!(transfer_summary(&[transfer.clone()]).contains("Sending text"));
+        assert!(transfer_summary(&[transfer.clone(), transfer.clone()]).contains("+1 more"));
+        let mut completed = transfer;
+        completed.phase = Phase::Complete;
+        assert!(transfer_summary(&[completed]).starts_with("Last transfer:"));
+    }
     #[test]
     fn toggling_is_reversible_and_quit_is_sticky() {
         let on = TrayState {
@@ -510,11 +577,17 @@ mod tests {
         let scanning = ConnectionSnapshot {
             scanning: true,
             advertising: false,
+            connecting: 0,
             peers: vec![],
         };
         assert!(connection_label(enabled, &scanning).contains("disconnected"));
-        assert!(scan_label(enabled, &scanning).contains("15 seconds"));
+        assert!(scan_label(enabled, &scanning).contains("2 seconds"));
         assert!(connection_label(paused, &scanning).contains("paused"));
+        let connecting = ConnectionSnapshot {
+            connecting: 1,
+            ..scanning.clone()
+        };
+        assert!(connection_label(enabled, &connecting).contains("connecting (1)"));
         let peer = crate::status::PeerView {
             id: uuid::Uuid::nil(),
             inbound: 1,

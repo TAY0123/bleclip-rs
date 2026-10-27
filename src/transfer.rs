@@ -347,9 +347,9 @@ impl Incoming {
                 if let Some(progress) = &mut self.progress {
                     progress.update(
                         id,
-                        update.kind,
-                        update.bytes.len(),
-                        update.bytes.len(),
+                        r.header.kind,
+                        r.header.size as usize,
+                        r.header.size as usize,
                         Phase::Complete,
                         1,
                     );
@@ -534,8 +534,13 @@ mod tests {
     #[test]
     fn roundtrip_maximum_text_with_ack() {
         let update = Update::text(Uuid::new_v4(), "x".repeat(crate::message::MAX_TEXT)).unwrap();
+        let monitor = crate::progress::Transfers::new();
+        let view = monitor.subscribe();
         let mut out = Outgoing::default();
         let mut incoming = Incoming::default();
+        out.set_progress(monitor.reporter(Uuid::new_v4(), crate::progress::Direction::Sending));
+        incoming
+            .set_progress(monitor.reporter(Uuid::new_v4(), crate::progress::Direction::Receiving));
         out.enqueue(update.clone()).unwrap();
         let now = Instant::now();
         let mut received = None;
@@ -551,6 +556,13 @@ mod tests {
         }
         assert_eq!(received, Some(update));
         assert!(out.next(now).is_none());
+        let views = view.borrow();
+        assert_eq!(views.len(), 2);
+        assert!(views.iter().all(|v| v.kind == Kind::CompressedText
+            && v.phase == Phase::Complete
+            && v.percent() == 100
+            && v.bytes == v.total
+            && v.total < MAX_TEXT));
     }
     #[test]
     fn text_is_compressed_only_above_threshold() {

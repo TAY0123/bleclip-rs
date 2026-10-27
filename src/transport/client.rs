@@ -5,7 +5,7 @@ use super::{READ_ID, SERVICE_ID, WRITE_ID};
 use crate::{
     crypto::{Initiator, Psk, Session},
     message::{Message, Update},
-    status::{Connections, LinkRole},
+    status::{ConnectingGuard, Connections, LinkRole},
     transfer::{Incoming, Outgoing},
     wire::{self, Decoder},
 };
@@ -28,12 +28,14 @@ use uuid::Uuid;
 
 const ATT_OPERATION_TIMEOUT: Duration = Duration::from_secs(12);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
-/// Discovery starts immediately, then polls the scanned BLE cache every 15 s.
-/// Failed connection attempts are held off for one interval (not 30 seconds).
-pub(crate) const DISCOVERY_INTERVAL: Duration = Duration::from_secs(15);
+/// Keep radio scanning active and inspect its cache promptly. Retry failures
+/// less often so unreachable or untrusted devices do not monopolize links.
+pub(crate) const DISCOVERY_INTERVAL: Duration = Duration::from_secs(2);
+const RETRY_INTERVAL: Duration = Duration::from_secs(15);
+const DISCOVERY_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn retry_ready(since_attempt: Duration) -> bool {
-    since_attempt >= DISCOVERY_INTERVAL
+    since_attempt >= RETRY_INTERVAL
 }
 
 async fn send_packet(peer: &Peripheral, ch: &Characteristic, payload: &[u8]) -> Result<()> {
@@ -80,6 +82,7 @@ async fn run_authenticated(
     to_peers: broadcast::Sender<Update>,
     active_nodes: Arc<Mutex<HashSet<Uuid>>>,
     connections: Arc<Connections>,
+    connecting: ConnectingGuard,
 ) -> Result<()> {
     timeout(CONNECT_TIMEOUT, peer.discover_services())
         .await
@@ -124,6 +127,7 @@ async fn run_authenticated(
         }
     }
     let _link = connections.track(LinkRole::Outbound, peer.id().to_string(), remote_id);
+    drop(connecting);
     println!("Outgoing encrypted BLE connection to {remote_id}");
     let result = connected_loop(
         peer,
@@ -222,10 +226,19 @@ async fn connect_one(
     active_nodes: Arc<Mutex<HashSet<Uuid>>>,
     connections: Arc<Connections>,
 ) -> Result<()> {
-    if !peer.is_connected().await? {
-        timeout(CONNECT_TIMEOUT, peer.connect())
+    let connecting = connections.track_connecting(peer.id().to_string());
+    let connected = timeout(CONNECT_TIMEOUT, peer.is_connected())
+        .await
+        .context("BLE connection state timeout")??;
+    if !connected {
+        let result = timeout(CONNECT_TIMEOUT, peer.connect())
             .await
-            .context("BLE connect timeout")??;
+            .context("BLE connect timeout")
+            .and_then(|result| result.map_err(Into::into));
+        if let Err(error) = result {
+            let _ = timeout(Duration::from_secs(5), peer.disconnect()).await;
+            return Err(error);
+        }
     }
     let result = run_authenticated(
         &peer,
@@ -235,6 +248,7 @@ async fn connect_one(
         to_peers,
         active_nodes,
         connections,
+        connecting,
     )
     .await;
     let _ = timeout(Duration::from_secs(5), peer.disconnect()).await;
@@ -269,16 +283,21 @@ pub async fn run(
     let mut active = HashSet::<String>::new();
     let mut retried = HashMap::<String, Instant>::new();
     let mut workers = JoinSet::<(String, Result<()>)>::new();
+    let mut worker_ids = HashMap::new();
     let mut tick = interval(DISCOVERY_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = tick.tick() => {
                 if active.len() >= max_outbound { continue; }
-                let devices = match adapter.peripherals().await {
-                    Ok(devices) => devices,
-                    Err(error) => {
+                let devices = match timeout(DISCOVERY_OPERATION_TIMEOUT, adapter.peripherals()).await {
+                    Ok(Ok(devices)) => devices,
+                    Ok(Err(error)) => {
                         eprintln!("BLE scan enumeration failed: {error}");
+                        continue;
+                    }
+                    Err(_) => {
+                        eprintln!("BLE scan enumeration timed out");
                         continue;
                     }
                 };
@@ -288,8 +307,8 @@ pub async fn run(
                     if active.contains(&id) || retried.get(&id).is_some_and(|t| !retry_ready(t.elapsed())) {
                         continue;
                     }
-                    let props = match candidate.properties().await {
-                        Ok(Some(properties)) => properties,
+                    let props = match timeout(DISCOVERY_OPERATION_TIMEOUT, candidate.properties()).await {
+                        Ok(Ok(Some(properties))) => properties,
                         _ => continue,
                     };
                     let discovered_by_service = props.services.contains(&SERVICE_ID);
@@ -303,17 +322,20 @@ pub async fn run(
                     let broadcast = to_peers.clone();
                     let nodes = active_nodes.clone();
                     let tracker = Arc::clone(&connections);
-                    workers.spawn(async move {
+                    let candidate_id = id.clone();
+                    let handle = workers.spawn(async move {
                         let result = connect_one(candidate, psk, own_id, tx, broadcast, nodes, tracker).await;
                         (id, result)
                     });
+                    worker_ids.insert(handle.id(), candidate_id);
                 }
                 // Bound retry metadata if adapters report many unrelated devices.
                 retried.retain(|id, stamp| active.contains(id) || stamp.elapsed() < Duration::from_secs(180));
             }
-            finished = workers.join_next(), if !workers.is_empty() => {
+            finished = workers.join_next_with_id(), if !workers.is_empty() => {
                 match finished {
-                    Some(Ok((id, result))) => {
+                    Some(Ok((task_id, (id, result)))) => {
+                        worker_ids.remove(&task_id);
                         active.remove(&id);
                         retried.insert(id.clone(), Instant::now());
                         // A disconnected link frees a connection slot: inspect
@@ -324,6 +346,10 @@ pub async fn run(
                         }
                     }
                     Some(Err(error)) => {
+                        if let Some(id) = worker_ids.remove(&error.id()) {
+                            active.remove(&id);
+                            retried.insert(id, Instant::now());
+                        }
                         eprintln!("BLE connection task failed: {error}");
                         tick.reset_immediately();
                     },
@@ -338,8 +364,9 @@ pub async fn run(
 mod discovery_tests {
     use super::*;
     #[test]
-    fn retry_interval_is_fifteen_seconds() {
-        assert_eq!(DISCOVERY_INTERVAL, Duration::from_secs(15));
+    fn discovery_is_fast_and_retries_are_rate_limited() {
+        assert_eq!(DISCOVERY_INTERVAL, Duration::from_secs(2));
+        assert_eq!(RETRY_INTERVAL, Duration::from_secs(15));
         assert!(!retry_ready(Duration::from_secs(14)));
         assert!(!retry_ready(Duration::from_millis(14999)));
         assert!(retry_ready(Duration::from_secs(15)));

@@ -2,7 +2,7 @@
 //! Notifications are snapshots rather than transport events, so a late receiver
 //! always sees the actual current list of connected peers.
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
 };
 use tokio::sync::watch;
@@ -38,6 +38,7 @@ impl PeerView {
 pub(crate) struct ConnectionSnapshot {
     pub scanning: bool,
     pub advertising: bool,
+    pub connecting: usize,
     pub peers: Vec<PeerView>,
 }
 
@@ -45,6 +46,7 @@ pub(crate) struct ConnectionSnapshot {
 struct State {
     scanning: bool,
     advertising: bool,
+    connecting: BTreeSet<String>,
     links: BTreeMap<(LinkRole, String), Uuid>,
 }
 
@@ -65,6 +67,7 @@ impl State {
         ConnectionSnapshot {
             scanning: self.scanning,
             advertising: self.advertising,
+            connecting: self.connecting.len(),
             peers: unique.into_values().collect(),
         }
     }
@@ -145,6 +148,28 @@ impl Connections {
             role,
         }
     }
+
+    pub fn track_connecting(self: &Arc<Self>, link: String) -> ConnectingGuard {
+        self.change(|state| {
+            state.connecting.insert(link.clone());
+        });
+        ConnectingGuard {
+            connections: Arc::clone(self),
+            link,
+        }
+    }
+}
+
+pub(crate) struct ConnectingGuard {
+    connections: Arc<Connections>,
+    link: String,
+}
+impl Drop for ConnectingGuard {
+    fn drop(&mut self) {
+        self.connections.change(|state| {
+            state.connecting.remove(&self.link);
+        });
+    }
 }
 
 /// When an async connection is cancelled, Drop clears its authenticated status
@@ -217,6 +242,17 @@ mod tests {
         peers.connected(LinkRole::Inbound, "aa".into(), Uuid::new_v4());
         peers.reset();
         assert_eq!(*peers.subscribe().borrow(), ConnectionSnapshot::default());
+    }
+
+    #[test]
+    fn connecting_attempt_is_removed_on_completion_or_cancellation() {
+        let peers = Connections::new();
+        let view = peers.subscribe();
+        let attempt = peers.track_connecting("candidate".into());
+        assert_eq!(view.borrow().connecting, 1);
+        assert!(view.borrow().peers.is_empty());
+        drop(attempt);
+        assert_eq!(view.borrow().connecting, 0);
     }
 
     #[test]
