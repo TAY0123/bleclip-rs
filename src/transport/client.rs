@@ -3,11 +3,11 @@
 
 use super::{
     bulk::{self, Bulk, BulkSender, EndpointLease},
-    BULK_ID, READ_ID, SERVICE_ID, WRITE_ID,
+    Network, BULK_ID, IP_ID, READ_ID, SERVICE_ID, WRITE_ID,
 };
 use crate::{
     crypto::{Initiator, Psk, Session},
-    message::{Message, Update},
+    message::{Kind, Message, Update},
     status::{ConnectingGuard, Connections, LinkRole},
     transfer::{Incoming, Outgoing},
     wire::{self, Decoder},
@@ -86,7 +86,7 @@ async fn run_authenticated(
     active_nodes: Arc<Mutex<HashSet<Uuid>>>,
     connections: Arc<Connections>,
     connecting: ConnectingGuard,
-    bulk: Arc<Bulk>,
+    network: Arc<Network>,
 ) -> Result<()> {
     timeout(CONNECT_TIMEOUT, peer.discover_services())
         .await
@@ -136,7 +136,7 @@ async fn run_authenticated(
     // Keep updates copied during optional negotiation in the bounded bus queue.
     let updates = to_peers.subscribe();
     let (bulk_sender, _bulk_lease) = if let Some(ch) = chars.iter().find(|ch| ch.uuid == BULK_ID) {
-        match negotiate_bulk(peer, ch, &mut session, &bulk, remote_id).await {
+        match negotiate_bulk(peer, ch, &mut session, &network.bulk, remote_id).await {
             Ok(pair) => pair,
             Err(error) => {
                 eprintln!("L2CAP negotiation with {remote_id} failed: {error:#}; using GATT");
@@ -146,6 +146,17 @@ async fn run_authenticated(
     } else {
         (None, None)
     };
+    let supports_ip = if let Some(ch) = chars.iter().find(|ch| ch.uuid == IP_ID) {
+        let packet = session.seal(b"IP01")?;
+        send_packet(peer, ch, &packet).await.is_ok()
+    } else {
+        false
+    };
+    if supports_ip {
+        if let Ok(update) = network.ip.announcement() {
+            let _ = to_peers.send(update);
+        }
+    }
     let result = connected_loop(
         peer,
         &write_char,
@@ -157,6 +168,8 @@ async fn run_authenticated(
         updates,
         Arc::clone(&connections.transfers),
         bulk_sender,
+        network,
+        supports_ip,
     )
     .await;
     active_nodes.lock().await.remove(&remote_id);
@@ -199,6 +212,8 @@ async fn connected_loop(
     mut updates: broadcast::Receiver<Update>,
     transfers: Arc<crate::progress::Transfers>,
     mut bulk_sender: Option<BulkSender>,
+    network: Arc<Network>,
+    supports_ip: bool,
 ) -> Result<()> {
     let mut incoming = Incoming::default();
     let mut outgoing = Outgoing::default();
@@ -245,8 +260,9 @@ async fn connected_loop(
             }
             change = updates.recv() => {
                 match change {
-                    Ok(update) => {
-                        if update.origin != remote_id {
+                    Ok(mut update) => {
+                        if !supports_ip && update.kind == Kind::FileRequest && update.bytes.len() > 32 { update.bytes = update.bytes[..32].into(); }
+                        if update.origin != remote_id && !(update.kind == Kind::IpEndpoint && !supports_ip) && !network.ip.offloaded(remote_id, update.id) {
                             if let Err(error) = outgoing.enqueue(update) {
                                 eprintln!("Outgoing {remote_id}: {error:#}");
                             }
@@ -270,7 +286,7 @@ async fn connect_one(
     to_peers: broadcast::Sender<Update>,
     active_nodes: Arc<Mutex<HashSet<Uuid>>>,
     connections: Arc<Connections>,
-    bulk: Arc<Bulk>,
+    network: Arc<Network>,
 ) -> Result<()> {
     let connecting = connections.track_connecting(peer.id().to_string());
     let connected = timeout(CONNECT_TIMEOUT, peer.is_connected())
@@ -295,7 +311,7 @@ async fn connect_one(
         active_nodes,
         connections,
         connecting,
-        bulk,
+        network,
     )
     .await;
     let _ = timeout(Duration::from_secs(5), peer.disconnect()).await;
@@ -310,7 +326,7 @@ pub async fn run(
     from_peers: mpsc::Sender<Update>,
     to_peers: broadcast::Sender<Update>,
     connections: Arc<Connections>,
-    bulk: Arc<Bulk>,
+    network: Arc<Network>,
 ) -> Result<()> {
     let manager = Manager::new()
         .await
@@ -370,10 +386,10 @@ pub async fn run(
                     let broadcast = to_peers.clone();
                     let nodes = active_nodes.clone();
                     let tracker = Arc::clone(&connections);
-                    let bulk = bulk.clone();
+                    let network = network.clone();
                     let candidate_id = id.clone();
                     let handle = workers.spawn(async move {
-                        let result = connect_one(candidate, psk, own_id, tx, broadcast, nodes, tracker, bulk).await;
+                        let result = connect_one(candidate, psk, own_id, tx, broadcast, nodes, tracker, network).await;
                         (id, result)
                     });
                     worker_ids.insert(handle.id(), candidate_id);

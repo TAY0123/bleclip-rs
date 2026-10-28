@@ -242,6 +242,11 @@ pub struct FileMetadata {
 }
 
 pub fn metadata(paths: &[PathBuf]) -> Result<Vec<FileMetadata>> {
+    let entries = metadata_ip(paths)?;
+    validate_metadata(&entries)?;
+    Ok(entries)
+}
+pub fn metadata_ip(paths: &[PathBuf]) -> Result<Vec<FileMetadata>> {
     ensure!(
         !paths.is_empty() && paths.len() <= MAX_ENTRIES,
         "select 1–16 files"
@@ -261,11 +266,25 @@ pub fn metadata(paths: &[PathBuf]) -> Result<Vec<FileMetadata>> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    validate_metadata(&entries)?;
+    validate_metadata_ip(&entries)?;
     Ok(entries)
 }
 
 pub fn validate_metadata(entries: &[FileMetadata]) -> Result<()> {
+    validate_metadata_ip(entries)?;
+    let total = entries
+        .iter()
+        .try_fold(2u64, |n, e| {
+            n.checked_add(e.size)?.checked_add(e.name.len() as u64 + 6)
+        })
+        .context("file size overflow")?;
+    ensure!(
+        total <= MAX_FILES as u64,
+        "file bundle exceeds 64 MiB; enable IP exchange for larger files"
+    );
+    Ok(())
+}
+pub fn validate_metadata_ip(entries: &[FileMetadata]) -> Result<()> {
     ensure!(
         !entries.is_empty() && entries.len() <= MAX_ENTRIES,
         "invalid file count"
@@ -282,9 +301,116 @@ pub fn validate_metadata(entries: &[FileMetadata]) -> Result<()> {
             .checked_add(entry.size)
             .and_then(|n| n.checked_add(entry.name.len() as u64 + 6))
             .context("file size overflow")?;
-        ensure!(total <= MAX_FILES as u64, "file bundle exceeds 64 MiB");
     }
     Ok(())
+}
+
+/// Version checks and no-follow opens keep an IP stream tied to the offered
+/// regular files. A changed source aborts before the final publish message.
+pub fn versions(paths: &[PathBuf]) -> Result<Vec<(u64, Option<std::time::SystemTime>)>> {
+    paths
+        .iter()
+        .map(|p| {
+            let m = fs::symlink_metadata(p)?;
+            ensure!(m.is_file(), "source is no longer a regular file");
+            Ok((m.len(), m.modified().ok()))
+        })
+        .collect()
+}
+pub fn open_regular(path: &Path) -> Result<fs::File> {
+    ensure!(
+        fs::symlink_metadata(path)?.is_file(),
+        "source is not a regular file"
+    );
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000);
+    }
+    let file = options.open(path)?;
+    ensure!(file.metadata()?.is_file(), "source is not a regular file");
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        ensure!(
+            file.metadata()?.file_attributes() & 0x400 == 0,
+            "source is a reparse point"
+        );
+    }
+    Ok(file)
+}
+
+pub struct StreamSave {
+    temp: PathBuf,
+    dest: PathBuf,
+    names: Vec<String>,
+    published: bool,
+}
+impl StreamSave {
+    pub fn new(root: &Path, id: Uuid, entries: &[FileMetadata]) -> Result<Self> {
+        validate_metadata_ip(entries)?;
+        fs::create_dir_all(root)?;
+        let dest = root.join(id.to_string());
+        ensure!(!dest.exists(), "transfer was already saved");
+        let temp = root.join(format!(".partial-{id}-{}", Uuid::new_v4()));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&temp)?;
+        let mut seen = HashSet::new();
+        let names = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let mut name = entry.name.clone();
+                let mut suffix = index;
+                while !seen.insert(name.to_ascii_lowercase()) {
+                    name = format!("{suffix}-{}", entry.name);
+                    suffix += 1;
+                }
+                name
+            })
+            .collect();
+        Ok(Self {
+            temp,
+            dest,
+            names,
+            published: false,
+        })
+    }
+    pub fn create(&self, index: usize) -> Result<fs::File> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        Ok(options.open(self.temp.join(&self.names[index]))?)
+    }
+    pub fn finish(mut self) -> Result<Vec<PathBuf>> {
+        ensure!(!self.dest.exists(), "transfer was already saved");
+        fs::rename(&self.temp, &self.dest)?;
+        self.published = true;
+        Ok(self.names.iter().map(|name| self.dest.join(name)).collect())
+    }
+}
+impl Drop for StreamSave {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_dir_all(&self.temp);
+        }
+    }
 }
 
 pub fn validate_offered_bundle(bytes: &[u8], expected: &[FileMetadata]) -> Result<()> {

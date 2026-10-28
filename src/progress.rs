@@ -18,6 +18,7 @@ pub enum Direction {
 pub enum Transport {
     Gatt,
     L2cap,
+    Ip,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Phase {
@@ -65,6 +66,7 @@ impl TransferView {
         let transport = match self.transport {
             Transport::Gatt => "BLE GATT",
             Transport::L2cap => "BLE L2CAP",
+            Transport::Ip => "IP TCP",
         };
         let state = match self.phase {
             Phase::Complete => "complete".into(),
@@ -123,6 +125,7 @@ impl Transfers {
             last: None,
             published: Instant::now(),
             transport: Transport::Gatt,
+            logged: None,
         }
     }
     fn publish(&self, source: Uuid, view: TransferView) {
@@ -159,8 +162,21 @@ pub struct Reporter {
     last: Option<TransferView>,
     published: Instant,
     transport: Transport,
+    logged: Option<(Uuid, usize, Phase)>,
 }
 impl Reporter {
+    pub fn complete(&mut self) {
+        if let Some(view) = self.last.clone() {
+            self.update(
+                view.id,
+                view.kind,
+                view.total,
+                view.total,
+                Phase::Complete,
+                view.attempt,
+            );
+        }
+    }
     pub fn with_transport(mut self, transport: Transport) -> Self {
         self.transport = transport;
         self
@@ -195,6 +211,11 @@ impl Reporter {
             .last
             .as_ref()
             .is_none_or(|old| old.id != id || old.phase != phase || old.attempt != attempt);
+        let milestone = (view.id, view.percent() / 10, view.phase);
+        if self.logged != Some(milestone) {
+            crate::logging::event(&view.label());
+            self.logged = Some(milestone);
+        }
         if transition || self.published.elapsed() >= Duration::from_millis(250) {
             self.transfers.publish(self.source, view.clone());
             self.published = Instant::now();
@@ -205,6 +226,7 @@ impl Reporter {
         if let Some(mut view) = self.last.take() {
             if view.phase.active() {
                 view.phase = Phase::Failed;
+                crate::logging::event(&view.label());
                 self.transfers.publish(self.source, view);
             }
         }

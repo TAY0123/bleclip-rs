@@ -322,31 +322,34 @@ impl BulkSender {
     }
 }
 
-async fn write_frame<S: AsyncWrite + Unpin>(stream: &mut S, bytes: &[u8]) -> Result<()> {
+pub(super) async fn write_frame<S: AsyncWrite + Unpin>(stream: &mut S, bytes: &[u8]) -> Result<()> {
     timeout(IDLE_TIMEOUT, stream.write_all(&wire::frame(bytes)?))
         .await
-        .context("L2CAP write timed out")??;
+        .context("data channel write timed out")??;
     Ok(())
 }
-async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
+pub(super) async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>> {
     timeout(IDLE_TIMEOUT, async {
         let len = stream.read_u32().await? as usize;
-        ensure!((1..=MAX_FRAME).contains(&len), "invalid L2CAP frame size");
+        ensure!(
+            (1..=MAX_FRAME).contains(&len),
+            "invalid data channel frame size"
+        );
         let mut bytes = vec![0; len];
         stream.read_exact(&mut bytes).await?;
         Ok(bytes)
     })
     .await
-    .context("L2CAP read timed out")?
+    .context("data channel read timed out")?
 }
-async fn write_message<S: AsyncWrite + Unpin>(
+pub(super) async fn write_message<S: AsyncWrite + Unpin>(
     stream: &mut S,
     session: &Session,
     message: Message,
 ) -> Result<()> {
     write_frame(stream, &session.seal(&message.encode()?)?).await
 }
-async fn read_message<S: AsyncRead + Unpin>(
+pub(super) async fn read_message<S: AsyncRead + Unpin>(
     stream: &mut S,
     session: &mut Session,
 ) -> Result<Message> {

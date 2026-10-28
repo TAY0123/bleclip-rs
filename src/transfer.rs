@@ -76,12 +76,25 @@ impl Outgoing {
     }
     pub fn enqueue(&mut self, mut update: Update) -> Result<()> {
         update.validate()?;
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|s| s.update.id == update.id)
+            || self.queue.iter().any(|u| u.id == update.id)
+        {
+            return Ok(());
+        }
+        if update.kind == Kind::IpEndpoint {
+            self.queue.retain(|u| u.kind != Kind::IpEndpoint);
+            self.queue.push_back(update);
+            return Ok(());
+        }
         let clipboard = is_clipboard(update.kind);
         if !clipboard
             && self
                 .queue
                 .iter()
-                .filter(|item| !is_clipboard(item.kind))
+                .filter(|item| !is_clipboard(item.kind) && item.kind != Kind::IpEndpoint)
                 .count()
                 >= MAX_QUEUE
         {
@@ -360,6 +373,7 @@ impl Incoming {
                     hops: r.header.hops,
                     kind,
                     bytes: Arc::from(bytes),
+                    via_ip: false,
                 };
                 update.validate()?;
                 if let Some(progress) = &mut self.progress {
@@ -390,6 +404,50 @@ impl Incoming {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn endpoint_announcements_do_not_fill_the_file_queue_and_retries_coalesce() {
+        let mut outgoing = Outgoing::default();
+        let origin = Uuid::new_v4();
+        for _ in 0..20 {
+            outgoing
+                .enqueue(Update::new(origin, Kind::IpEndpoint, b"null".to_vec()).unwrap())
+                .unwrap();
+        }
+        let files: Vec<_> = (0..4)
+            .map(|_| Update::new(origin, Kind::Files, vec![1; 100]).unwrap())
+            .collect();
+        for file in &files {
+            outgoing.enqueue(file.clone()).unwrap();
+        }
+        // One fallback for an already queued file must not use another slot.
+        outgoing.enqueue(files[0].clone()).unwrap();
+        let mut received = Vec::new();
+        let mut incoming = Incoming::default();
+        while let Some(message) = outgoing.next(Instant::now()) {
+            let result = incoming.handle(message, Instant::now()).unwrap();
+            if let Some(update) = result.update {
+                received.push(update);
+            }
+            if let Some(id) = result.ack {
+                outgoing.ack(id);
+            }
+        }
+        assert_eq!(
+            received
+                .iter()
+                .filter(|u| u.kind == Kind::IpEndpoint)
+                .count(),
+            1
+        );
+        assert_eq!(
+            received
+                .into_iter()
+                .filter(|u| u.kind == Kind::Files)
+                .collect::<Vec<_>>(),
+            files
+        );
+    }
+
     use crate::message::{Kind, MAX_FILES};
     #[test]
     fn latest_clipboard_item_survives_busy_link_without_dropping_files() {

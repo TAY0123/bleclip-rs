@@ -17,6 +17,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io::Cursor,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
@@ -129,19 +130,26 @@ fn observe(
         Observation::Text(s, dig)
     })
 }
+#[cfg(test)]
 fn png_encode(img: &ImageData<'_>) -> Result<Vec<u8>> {
+    png_encode_with_limit(img, true)
+}
+fn png_encode_with_limit(img: &ImageData<'_>, limited: bool) -> Result<Vec<u8>> {
     let pixels = img
         .width
         .checked_mul(img.height)
         .context("image dimensions overflow")?;
-    if pixels == 0 || pixels > MAX_PIXELS || img.bytes.len() != pixels * 4 {
+    if pixels == 0
+        || (limited && pixels > MAX_PIXELS)
+        || Some(img.bytes.len()) != pixels.checked_mul(4)
+    {
         bail!("invalid/oversized clipboard image");
     }
     let width = u32::try_from(img.width)?;
     let height = u32::try_from(img.height)?;
     let mut png = Vec::new();
     PngEncoder::new(&mut png).write_image(&img.bytes, width, height, ExtendedColorType::Rgba8)?;
-    if png.len() > MAX_PNG {
+    if limited && png.len() > MAX_PNG {
         bail!(
             "PNG compressed image {} bytes exceeds {}-byte limit",
             png.len(),
@@ -150,8 +158,12 @@ fn png_encode(img: &ImageData<'_>) -> Result<Vec<u8>> {
     }
     Ok(png)
 }
+#[cfg(test)]
 fn png_decode(png: &[u8]) -> Result<ImageData<'static>> {
-    if png.len() > MAX_PNG {
+    png_decode_with_limit(png, true)
+}
+fn png_decode_with_limit(png: &[u8], limited: bool) -> Result<ImageData<'static>> {
+    if limited && png.len() > MAX_PNG {
         bail!("oversized image");
     }
     let mut reader = ImageReader::with_format(Cursor::new(png), ImageFormat::Png);
@@ -159,13 +171,17 @@ fn png_decode(png: &[u8]) -> Result<ImageData<'static>> {
     limits.max_alloc = Some((MAX_PIXELS * 4) as u64);
     limits.max_image_width = Some(8192);
     limits.max_image_height = Some(8192);
+    if !limited {
+        limits = Limits::no_limits();
+    }
     reader.limits(limits);
     let rgba = reader.decode()?.to_rgba8();
     let (width, height) = rgba.dimensions();
-    if (width as usize)
-        .checked_mul(height as usize)
-        .unwrap_or(usize::MAX)
-        > MAX_PIXELS
+    if limited
+        && (width as usize)
+            .checked_mul(height as usize)
+            .unwrap_or(usize::MAX)
+            > MAX_PIXELS
     {
         bail!("decoded image exceeds pixel limit");
     }
@@ -177,6 +193,7 @@ fn png_decode(png: &[u8]) -> Result<ImageData<'static>> {
 }
 
 pub struct ClipboardSync {
+    ip: Option<Arc<crate::transport::ip::IpService>>,
     self_id: Uuid,
     clipboard: Clipboard,
     last_signature: Option<[u8; 32]>,
@@ -205,6 +222,7 @@ impl ClipboardSync {
         let last_signature = observe(&mut clipboard, allow_images, allow_files).map(|o| o.digest());
         let (paste_tx, paste_rx) = tokio::sync::mpsc::unbounded_channel();
         Ok(Self {
+            ip: None,
             self_id,
             clipboard,
             last_signature,
@@ -220,6 +238,12 @@ impl ClipboardSync {
             pending: HashMap::new(),
             file_commands: crate::tray::file_commands().subscribe(),
         })
+    }
+    pub fn set_ip(&mut self, ip: Arc<crate::transport::ip::IpService>) {
+        self.ip = Some(ip);
+    }
+    fn ip_enabled(&self) -> bool {
+        self.ip.as_ref().is_some_and(|ip| ip.enabled())
     }
     pub fn check_local_change(&mut self, self_id: Uuid) -> Option<Update> {
         self.poll_file_actions(self_id);
@@ -246,14 +270,22 @@ impl ClipboardSync {
         self.last_signature = Some(hash); // skip repeated oversize/error messages
         let result = match value {
             Observation::Text(text, _) => {
-                if text.len() > MAX_TEXT {
+                if self.ip_enabled() {
+                    Update::new_ip(self_id, Kind::Text, text.into_bytes())
+                } else if text.len() > MAX_TEXT {
                     bail_local("text exceeds 8 MiB")
                 } else {
                     Update::text(self_id, text)
                 }
             }
             Observation::Image(img, _) => {
-                png_encode(&img).and_then(|png| Update::new(self_id, Kind::Png, png))
+                png_encode_with_limit(&img, !self.ip_enabled()).and_then(|png| {
+                    if self.ip_enabled() {
+                        Update::new_ip(self_id, Kind::Png, png)
+                    } else {
+                        Update::new(self_id, Kind::Png, png)
+                    }
+                })
             }
             Observation::Files(paths, hash) => self.offer_files(self_id, paths, hash),
         };
@@ -266,10 +298,20 @@ impl ClipboardSync {
         }
     }
     pub fn apply_remote(&mut self, update: &Update) -> Result<bool> {
-        if !self.direction.can_receive() && update.kind != Kind::FileRequest {
+        if !self.direction.can_receive()
+            && !matches!(update.kind, Kind::FileRequest | Kind::IpEndpoint)
+        {
             return Ok(false);
         }
         match update.kind {
+            Kind::IpEndpoint => {
+                if let Some(ip) = &self.ip {
+                    ip.register(
+                        update.origin,
+                        crate::transport::ip::decode_endpoint(&update.bytes)?,
+                    );
+                }
+            }
             Kind::CompressedText => bail!("compressed text must be decoded before applying"),
             Kind::Text => {
                 let value = std::str::from_utf8(&update.bytes)?;
@@ -287,7 +329,7 @@ impl ClipboardSync {
                 if !self.allow_images {
                     return Ok(false);
                 }
-                let img = png_decode(&update.bytes)?;
+                let img = png_decode_with_limit(&update.bytes, !update.via_ip)?;
                 let hash = image_signature(&img);
                 if self.last_signature == Some(hash) {
                     return Ok(false);
@@ -302,8 +344,15 @@ impl ClipboardSync {
                 if !self.allow_files {
                     return Ok(false);
                 }
-                let paths =
-                    files::save_bundle(&update.bytes, Path::new(&self.receive_dir), update.id)?;
+                let paths = if let Some(paths) = self
+                    .ip
+                    .as_ref()
+                    .and_then(|ip| ip.take_files(update.id, None))
+                {
+                    paths
+                } else {
+                    files::save_bundle(&update.bytes, Path::new(&self.receive_dir), update.id)?
+                };
                 crate::desktop::notify(
                     "Files received",
                     &format!(
@@ -318,7 +367,7 @@ impl ClipboardSync {
                     return Ok(false);
                 }
                 let entries: Vec<files::FileMetadata> = serde_json::from_slice(&update.bytes)?;
-                files::validate_metadata(&entries)?;
+                files::validate_metadata_ip(&entries)?;
                 let summary = entries
                     .iter()
                     .map(|e| format!("{} ({} bytes)", e.name, e.size))
@@ -346,11 +395,30 @@ impl ClipboardSync {
                 crate::desktop::notify("Files available in clipboard", &format!("{summary}\nPaste in a file manager to download. Offer expires in 30 minutes."));
             }
             Kind::FileRequest => {
-                anyhow::ensure!(update.bytes.len() == 32, "invalid file request");
-                let offer_id = Uuid::from_slice(&update.bytes[..16])?;
-                let owner = Uuid::from_slice(&update.bytes[16..])?;
+                let (offer_id, owner, endpoint) =
+                    crate::transport::ip::decode_request(&update.bytes)?;
                 if owner != self.self_id {
                     return Ok(false);
+                }
+                if let Some(ip) = &self.ip {
+                    if let Some(endpoint) = endpoint.or_else(|| ip.peer(update.origin)) {
+                        if let Some(offer) = self.local_offers.iter().find(|o| {
+                            o.id == offer_id
+                                && o.created.elapsed() < OFFER_TTL
+                                && files_signature(&o.paths) == o.signature
+                        }) {
+                            if ip.send_files(
+                                Uuid::new_v4(),
+                                Some(update.id),
+                                update.origin,
+                                endpoint,
+                                offer.paths.clone(),
+                                offer.entries.clone(),
+                            )? {
+                                return Ok(true);
+                            }
+                        }
+                    }
                 }
                 anyhow::ensure!(
                     self.outgoing.len() < 4,
@@ -398,6 +466,9 @@ impl ClipboardSync {
                     "file response came from a different origin"
                 );
                 let pending = self.pending.remove(&request_id).unwrap();
+                if let Some(ip) = &self.ip {
+                    ip.revoke(request_id);
+                }
                 let result = (|| -> Result<Vec<PathBuf>> {
                     anyhow::ensure!(
                         pending.started.elapsed() < PASTE_TIMEOUT,
@@ -405,6 +476,13 @@ impl ClipboardSync {
                     );
                     if update.kind == Kind::FileError {
                         anyhow::bail!("{}", String::from_utf8_lossy(&update.bytes[16..]));
+                    }
+                    if let Some(paths) = self
+                        .ip
+                        .as_ref()
+                        .and_then(|ip| ip.take_files(update.id, Some(request_id)))
+                    {
+                        return Ok(paths);
                     }
                     files::validate_offered_bundle(&update.bytes[16..], &pending.request.entries)?;
                     files::save_bundle(&update.bytes[16..], &self.receive_dir, update.id)
@@ -423,7 +501,11 @@ impl ClipboardSync {
         paths: Vec<PathBuf>,
         signature: [u8; 32],
     ) -> Result<Update> {
-        let entries = files::metadata(&paths)?;
+        let entries = if self.ip_enabled() {
+            files::metadata_ip(&paths)?
+        } else {
+            files::metadata(&paths)?
+        };
         let update = Update::new(self_id, Kind::FileOffer, serde_json::to_vec(&entries)?)?;
         if self.local_offers.len() == 4 {
             self.local_offers.pop_front();
@@ -438,8 +520,15 @@ impl ClipboardSync {
         Ok(update)
     }
     fn poll_file_actions(&mut self, self_id: Uuid) {
-        self.pending
-            .retain(|_, pending| pending.started.elapsed() < PASTE_TIMEOUT);
+        self.pending.retain(|id, pending| {
+            let keep = pending.started.elapsed() < PASTE_TIMEOUT;
+            if !keep {
+                if let Some(ip) = &self.ip {
+                    ip.revoke(*id);
+                }
+            }
+            keep
+        });
         while let Ok(request) = self.paste_rx.try_recv() {
             // Bounded independently of native clipboard readers.
             if !self.allow_files || self.pending.len() >= 4 {
@@ -451,7 +540,27 @@ impl ClipboardSync {
             let mut bytes = request.offer.as_bytes().to_vec();
             bytes.extend_from_slice(request.origin.as_bytes());
             match Update::new(self_id, Kind::FileRequest, bytes) {
-                Ok(update) => {
+                Ok(mut update) => {
+                    if let Some(ip) = &self.ip {
+                        if ip.supports(request.origin) {
+                            if let Some(endpoint) =
+                                ip.prepare(update.id, request.origin, request.entries.clone())
+                            {
+                                match crate::transport::ip::encode_request(
+                                    request.offer,
+                                    request.origin,
+                                    Some(&endpoint),
+                                ) {
+                                    Ok(bytes) => update.bytes = bytes.into(),
+                                    Err(_) => ip.revoke(update.id),
+                                }
+                                crate::logging::event(&format!(
+                                    "File paste {}: requesting IP delivery to {}",
+                                    update.id, endpoint.address
+                                ));
+                            }
+                        }
+                    }
                     self.pending.insert(
                         update.id,
                         PendingPaste {
@@ -471,10 +580,26 @@ impl ClipboardSync {
                 Ok(paths)
                     if self.allow_files && self.direction.can_send() && self.outgoing.len() < 4 =>
                 {
-                    let result = files::encode_paths(&paths)
-                        .and_then(|bytes| Update::new(self_id, Kind::Files, bytes));
+                    let result = (|| -> Result<Option<Update>> {
+                        let id = Uuid::new_v4();
+                        if let Some(ip) = self.ip.as_ref().filter(|ip| ip.enabled()) {
+                            let entries = files::metadata_ip(&paths)?;
+                            let count = ip.broadcast_files(id, paths.clone(), entries.clone())?;
+                            if count > 0
+                                && (!ip.has_ble_recipients()
+                                    || files::validate_metadata(&entries).is_err())
+                            {
+                                return Ok(None);
+                            }
+                        }
+                        let mut update =
+                            Update::new(self_id, Kind::Files, files::encode_paths(&paths)?)?;
+                        update.id = id;
+                        Ok(Some(update))
+                    })();
                     match result {
-                        Ok(update) => self.outgoing.push_back(update),
+                        Ok(Some(update)) => self.outgoing.push_back(update),
+                        Ok(None) => {}
                         Err(err) => {
                             crate::desktop::notify("Cannot send files", &format!("{err:#}"))
                         }
@@ -491,7 +616,7 @@ impl ClipboardSync {
     }
     pub fn allows(&self, kind: Kind) -> bool {
         match kind {
-            Kind::Text => true,
+            Kind::Text | Kind::IpEndpoint => true,
             Kind::Png => self.allow_images,
             _ => self.allow_files,
         }
@@ -531,6 +656,109 @@ mod tests {
 #[cfg(all(test, target_os = "linux"))]
 mod lazy_file_tests {
     use super::*;
+    #[test]
+    #[ignore = "requires an isolated X11 display; run with xvfb-run and WAYLAND_DISPLAY unset"]
+    fn native_file_paste_uses_advertised_ip_listener() {
+        use crate::transport::ip::{
+            settings::{Control, Settings},
+            IpService,
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _entered = rt.enter();
+        let root = std::env::temp_dir().join(format!("bleclip-native-ip-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("hello.txt");
+        std::fs::write(&source, b"native IP paste").unwrap();
+        let a_id = Uuid::new_v4();
+        let b_id = Uuid::new_v4();
+        let config = || {
+            Control::memory(Settings {
+                enabled: true,
+                receive_ip: Some("127.0.0.1".parse().unwrap()),
+                port: 0,
+            })
+        };
+        let (a_tx, _a_rx) = tokio::sync::mpsc::channel(16);
+        let (b_tx, mut b_rx) = tokio::sync::mpsc::channel(16);
+        let (bus, _bus_rx) = tokio::sync::broadcast::channel(16);
+        let (a_ip, _a_runtime) = IpService::start(
+            [50; 32],
+            a_id,
+            a_tx,
+            bus.clone(),
+            crate::status::Connections::new(),
+            root.join("a"),
+            config(),
+            (false, true, true),
+        );
+        let (b_ip, _b_runtime) = IpService::start(
+            [50; 32],
+            b_id,
+            b_tx,
+            bus,
+            crate::status::Connections::new(),
+            root.join("b"),
+            config(),
+            (true, true, true),
+        );
+        rt.block_on(async {
+            let mut changes = b_ip.subscribe();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if changes.borrow_and_update().is_some() {
+                        break;
+                    }
+                    changes.changed().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        });
+        let mut a = ClipboardSync::new(a_id, Direction::Send, true, true, root.join("a")).unwrap();
+        let mut b =
+            ClipboardSync::new(b_id, Direction::Receive, true, true, root.join("b")).unwrap();
+        a.set_ip(a_ip.clone());
+        b.set_ip(b_ip.clone());
+        a.apply_remote(&b_ip.announcement().unwrap()).unwrap();
+        b.apply_remote(&a_ip.announcement().unwrap()).unwrap();
+        a.clipboard.set().file_list(&[source]).unwrap();
+        let offer = a.check_local_change(a_id).unwrap();
+        b.apply_remote(&offer).unwrap();
+        let paste = std::thread::spawn(|| Clipboard::new().unwrap().get().file_list().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let request = loop {
+            if let Some(request) = b.check_local_change(b_id) {
+                break request;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(crate::transport::ip::decode_request(&request.bytes)
+            .unwrap()
+            .2
+            .is_some());
+        a.apply_remote(&request).unwrap();
+        let response = rt
+            .block_on(tokio::time::timeout(Duration::from_secs(5), b_rx.recv()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.kind, Kind::FileResponse);
+        assert!(response.via_ip);
+        b.apply_remote(&response).unwrap();
+        let paths = paste.join().unwrap();
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), b"native IP paste");
+        assert!(a.outgoing.is_empty());
+        assert!(b.pending.is_empty());
+        drop(b);
+        drop(a);
+        drop(_b_runtime);
+        drop(_a_runtime);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     #[ignore = "requires an isolated X11 display; run with xvfb-run and WAYLAND_DISPLAY unset"]
     fn native_file_paste_fetches_once_after_metadata_offer() {

@@ -5,6 +5,7 @@ mod desktop;
 mod file_clipboard;
 mod files;
 mod identity;
+mod logging;
 mod message;
 mod platform;
 mod progress;
@@ -239,6 +240,20 @@ pub(crate) async fn run_peer(
         Some(path) => path,
         None => default_receive_dir()?,
     };
+    let (ip, _ip_runtime) = transport::ip::IpService::start(
+        psk,
+        own_id,
+        from_peers_tx.clone(),
+        to_peers_tx.clone(),
+        connections.clone(),
+        receive_dir.clone(),
+        transport::ip::settings::global(),
+        (direction.can_receive(), allow_images, allow_files),
+    );
+    let network = Arc::new(transport::Network {
+        bulk,
+        ip: ip.clone(),
+    });
     println!(
         "BLEClip {}, node {own_id}, encrypted mesh enabled. Press Ctrl+C to quit.",
         env!("CARGO_PKG_VERSION")
@@ -255,7 +270,7 @@ pub(crate) async fn run_peer(
         let sender = from_peers_tx.clone();
         let name = name.clone();
         let server_connections = Arc::clone(&connections);
-        let bulk = bulk.clone();
+        let network = network.clone();
         Some(tokio::spawn(async move {
             loop {
                 if let Err(error) = transport::server::run(
@@ -266,7 +281,7 @@ pub(crate) async fn run_peer(
                     sender.clone(),
                     updates.clone(),
                     Arc::clone(&server_connections),
-                    bulk.clone(),
+                    network.clone(),
                 )
                 .await
                 {
@@ -289,7 +304,7 @@ pub(crate) async fn run_peer(
         let updates = to_peers_tx.clone();
         let sender = from_peers_tx.clone();
         let client_connections = Arc::clone(&connections);
-        let bulk = bulk.clone();
+        let network = network.clone();
         Some(tokio::spawn(async move {
             loop {
                 if let Err(error) = transport::client::run(
@@ -300,7 +315,7 @@ pub(crate) async fn run_peer(
                     sender.clone(),
                     updates.clone(),
                     Arc::clone(&client_connections),
-                    bulk.clone(),
+                    network.clone(),
                 )
                 .await
                 {
@@ -315,7 +330,7 @@ pub(crate) async fn run_peer(
 
     // Exactly one owner of the desktop clipboard, even if many BLE links exist.
     let result = tokio::select! {
-        result = router::run(own_id, direction, from_peers_rx, to_peers_tx, allow_images, allow_files, receive_dir) => result,
+        result = router::run(own_id, direction, from_peers_rx, to_peers_tx, allow_images, allow_files, receive_dir, ip) => result,
         _ = tokio::signal::ctrl_c() => Ok(()),
         _ = async {
             match shutdown.as_mut() {

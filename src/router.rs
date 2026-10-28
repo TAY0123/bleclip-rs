@@ -1,12 +1,14 @@
 //! Multi-peer fan-out with per-event deduplication. Each completed binary
-//! transfer is relayed as a whole (bounded at 64 MiB), not half-written files.
+//! BLE transfer is relayed as a whole. IP files are streamed directly to their recipient.
 use crate::{
     clipboard::{ClipboardSync, Direction},
     message::{Kind, Update, MAX_HOPS},
+    transport::ip::IpService,
 };
 use std::{
     collections::{HashSet, VecDeque},
     path::PathBuf,
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -44,9 +46,15 @@ impl Router {
         true
     }
     pub fn local(&mut self, update: Update) -> Option<Update> {
-        if (!self.direction.can_send() && !matches!(update.kind, Kind::FileRequest))
+        if (!self.direction.can_send()
+            && !matches!(update.kind, Kind::FileRequest | Kind::IpEndpoint))
             || update.origin != self.self_id
-            || update.validate().is_err()
+            || (if update.via_ip {
+                update.validate_ip()
+            } else {
+                update.validate()
+            })
+            .is_err()
         {
             return None;
         }
@@ -54,10 +62,16 @@ impl Router {
     }
     /// Returns (accepted update, relay if enabled).
     pub fn remote(&mut self, update: Update) -> Option<(Update, Option<Update>)> {
-        if (!self.direction.can_receive() && !matches!(update.kind, Kind::FileRequest))
+        if (!self.direction.can_receive()
+            && !matches!(update.kind, Kind::FileRequest | Kind::IpEndpoint))
             || update.origin == self.self_id
             || update.hops > MAX_HOPS
-            || update.validate().is_err()
+            || (if update.via_ip {
+                update.validate_ip()
+            } else {
+                update.validate()
+            })
+            .is_err()
             || !self.remember(update.id)
         {
             return None;
@@ -80,18 +94,30 @@ pub async fn run(
     allow_images: bool,
     allow_files: bool,
     receive_dir: PathBuf,
+    ip: Arc<IpService>,
 ) -> anyhow::Result<()> {
     let mut clipboard =
         ClipboardSync::new(self_id, direction, allow_images, allow_files, receive_dir)?;
+    clipboard.set_ip(ip.clone());
     let mut router = Router::new(self_id, direction);
     let mut poll = interval(Duration::from_millis(500));
+    let mut announce = interval(Duration::from_secs(10));
+    let mut endpoints = ip.subscribe();
     println!("Node {self_id}: desktop clipboard monitor active ({direction:?})");
     loop {
         tokio::select! {
+            _ = announce.tick() => {
+                if let Ok(update) = ip.announcement() { if let Some(update) = router.local(update) { let _ = to_peers.send(update); } }
+            }
+            _ = endpoints.changed() => {
+                endpoints.borrow_and_update();
+                if let Ok(update) = ip.announcement() { if let Some(update) = router.local(update) { let _ = to_peers.send(update); } }
+            }
             _ = poll.tick() => {
                 if let Some(update) = clipboard.check_local_change(self_id) {
                     if let Some(update) = router.local(update) {
                         println!("Local {:?} update {} ({} bytes)", update.kind, update.id, update.bytes.len());
+                        ip.route(&update);
                         let _ = to_peers.send(update);
                     }
                 }
@@ -103,7 +129,8 @@ pub async fn run(
                     match clipboard.apply_remote(&accepted) {
                         Ok(applied) => {
                             if applied { println!("Remote {:?} update {} ({} bytes)", accepted.kind, accepted.id, accepted.bytes.len()); }
-                            if let Some(next) = relay { let _ = to_peers.send(next); }
+                            let consumed = applied && (matches!(accepted.kind, Kind::FileResponse | Kind::FileError) || (accepted.via_ip && accepted.kind == Kind::Files));
+                            if !consumed { if let Some(next) = relay { ip.route(&next); let _ = to_peers.send(next); } }
                         }
                         Err(err) => eprintln!("Remote {:?} update {} rejected: {err:#}", accepted.kind, accepted.id),
                     }

@@ -30,6 +30,7 @@ pub enum Kind {
     FileResponse = 6,
     FileError = 7,
     CompressedText = 8,
+    IpEndpoint = 9,
 }
 impl Kind {
     pub fn from_byte(byte: u8) -> Result<Self> {
@@ -42,6 +43,7 @@ impl Kind {
             6 => Ok(Self::FileResponse),
             7 => Ok(Self::FileError),
             8 => Ok(Self::CompressedText),
+            9 => Ok(Self::IpEndpoint),
             _ => bail!("unknown payload type"),
         }
     }
@@ -52,7 +54,7 @@ impl Kind {
             Self::Png => MAX_PNG,
             Self::Files => MAX_FILES,
             Self::FileOffer | Self::FileError => MAX_FILE_CONTROL,
-            Self::FileRequest => 32,
+            Self::FileRequest | Self::IpEndpoint => 512,
             Self::FileResponse => MAX_FILES + 16,
         }
     }
@@ -65,6 +67,8 @@ pub struct Update {
     pub hops: u8,
     pub kind: Kind,
     pub bytes: Arc<[u8]>,
+    /// Local delivery metadata only; never accepted from a BLE header.
+    pub via_ip: bool,
 }
 impl Update {
     pub fn new(origin: Uuid, kind: Kind, bytes: Vec<u8>) -> Result<Self> {
@@ -74,6 +78,7 @@ impl Update {
             hops: MAX_HOPS,
             kind,
             bytes: bytes.into(),
+            via_ip: false,
         };
         update.validate()?;
         Ok(update)
@@ -81,14 +86,35 @@ impl Update {
     pub fn text(origin: Uuid, text: String) -> Result<Self> {
         Self::new(origin, Kind::Text, text.into_bytes())
     }
+    pub fn new_ip(origin: Uuid, kind: Kind, bytes: Vec<u8>) -> Result<Self> {
+        let update = Self {
+            id: Uuid::new_v4(),
+            origin,
+            hops: MAX_HOPS,
+            kind,
+            bytes: bytes.into(),
+            via_ip: true,
+        };
+        update.validate_ip()?;
+        Ok(update)
+    }
+    pub fn validate_ip(&self) -> Result<()> {
+        self.validate_inner(true)
+    }
     pub fn validate(&self) -> Result<()> {
+        self.validate_inner(false)
+    }
+    fn validate_inner(&self, ip: bool) -> Result<()> {
         ensure!(
             !self.id.is_nil() && !self.origin.is_nil(),
             "nil update identifier"
         );
         ensure!(self.hops <= MAX_HOPS, "invalid remaining hops");
         ensure!(
-            self.bytes.len() <= self.kind.limit(),
+            (ip && matches!(
+                self.kind,
+                Kind::Text | Kind::Png | Kind::Files | Kind::CompressedText | Kind::FileResponse
+            )) || self.bytes.len() <= self.kind.limit(),
             "payload exceeds type limit"
         );
         match self.kind {
@@ -96,12 +122,10 @@ impl Update {
                 std::str::from_utf8(&self.bytes)?;
             }
             Kind::FileRequest => {
-                ensure!(self.bytes.len() == 32, "invalid file request length");
-                ensure!(
-                    !Uuid::from_slice(&self.bytes[..16])?.is_nil()
-                        && !Uuid::from_slice(&self.bytes[16..])?.is_nil(),
-                    "nil file offer/owner identifier"
-                );
+                crate::transport::ip::decode_request(&self.bytes)?;
+            }
+            Kind::IpEndpoint => {
+                crate::transport::ip::decode_endpoint(&self.bytes)?;
             }
             Kind::FileResponse | Kind::FileError => {
                 ensure!(self.bytes.len() >= 16, "missing file request identifier");

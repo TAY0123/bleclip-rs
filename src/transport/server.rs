@@ -4,11 +4,11 @@
 
 use super::{
     bulk::{self, Bulk, BulkSender, EndpointLease},
-    BULK_ID, READ_ID, SERVICE_ID, WRITE_ID,
+    Network, BULK_ID, IP_ID, READ_ID, SERVICE_ID, WRITE_ID,
 };
 use crate::{
     crypto::{self, PendingServer, Psk, Session},
-    message::{Message, Update},
+    message::{Kind, Message, Update},
     status::{Connections, LinkRole},
     transfer::{Incoming, Outgoing},
     wire::{self, Decoder},
@@ -53,6 +53,8 @@ struct Peer {
     receipts: VecDeque<Uuid>,
     state: PeerState,
     last_activity: Instant,
+    ip_rx: Decoder,
+    supports_ip: bool,
     bulk_rx: Decoder,
     bulk_tx: VecDeque<u8>,
     bulk_sender: Option<BulkSender>,
@@ -69,6 +71,8 @@ impl Peer {
             receipts: VecDeque::new(),
             state: PeerState::Unauthenticated,
             last_activity: Instant::now(),
+            ip_rx: Decoder::default(),
+            supports_ip: false,
             bulk_rx: Decoder::default(),
             bulk_tx: VecDeque::new(),
             bulk_sender: None,
@@ -96,6 +100,8 @@ impl Peer {
             self.bulk_lease = None;
             self.bulk_rx = Decoder::default();
             self.bulk_tx.clear();
+            self.supports_ip = false;
+            self.ip_rx = Decoder::default();
             wire::queue_frame(&mut self.tx, &reply)?;
             self.state = PeerState::WaitingForFinish(pending);
             return Ok(None);
@@ -156,8 +162,32 @@ impl Peer {
         } = &self.state
         {
             if *remote_id != update.origin {
-                self.sender.enqueue(update.clone())?;
+                let mut update = update.clone();
+                if update.kind == Kind::IpEndpoint && !self.supports_ip {
+                    return Ok(());
+                }
+                if update.kind == Kind::FileRequest && !self.supports_ip && update.bytes.len() > 32
+                {
+                    update.bytes = update.bytes[..32].into();
+                }
+                self.sender.enqueue(update)?;
             }
+        }
+        Ok(())
+    }
+
+    fn ip_write(&mut self, value: &[u8]) -> Result<()> {
+        let PeerState::Authenticated {
+            session,
+            remote_id: Some(_),
+            ..
+        } = &mut self.state
+        else {
+            bail!("IP capability before authentication")
+        };
+        for packet in self.ip_rx.push(value)? {
+            ensure!(session.open(&packet)? == b"IP01", "invalid IP capability");
+            self.supports_ip = true;
         }
         Ok(())
     }
@@ -230,8 +260,9 @@ pub async fn run(
     from_peers: mpsc::Sender<Update>,
     to_peers: broadcast::Sender<Update>,
     connections: Arc<Connections>,
-    bulk: Arc<Bulk>,
+    network: Arc<Network>,
 ) -> Result<()> {
+    let bulk = network.bulk.clone();
     // On task cancellation, remove stale inbound tray entries even if the BLE
     // peripheral SDK does not emit a per-client disconnect event.
     let _role_guard = connections.track_role(LinkRole::Inbound);
@@ -269,6 +300,13 @@ pub async fn run(
             },
         ],
     };
+    service.characteristics.push(Characteristic {
+        uuid: IP_ID,
+        properties: vec![CharacteristicProperty::Write],
+        permissions: vec![AttributePermission::Writeable],
+        value: None,
+        descriptors: vec![],
+    });
     if bulk.available() {
         service.characteristics.push(Characteristic {
             uuid: BULK_ID,
@@ -309,6 +347,8 @@ pub async fn run(
                     match latest {
                         Ok(update) => {
                             for (remote, peer) in peers.iter_mut() {
+                                if update.kind == Kind::IpEndpoint && !peer.supports_ip { continue; }
+                                if peer.remote_id().is_some_and(|id| network.ip.offloaded(id, update.id)) { continue; }
                                 if let Err(error) = peer.offer(&update) {
                                     // Overflow is bounded. Do not break the authenticated
                                     // session or discard half-delivered frames.
@@ -349,6 +389,21 @@ pub async fn run(
                             let _ = responder.send(answer);
                         }
                         PeripheralEvent::WriteRequest { request, offset, value, responder } => {
+                            if request.service == SERVICE_ID && request.characteristic == IP_ID {
+                                let result = if offset != 0 || value.is_empty() || value.len() > wire::ATT_CHUNK {
+                                    Err(anyhow::anyhow!("invalid IP capability fragment"))
+                                } else if let Some(peer) = peers.get_mut(&request.client) {
+                                    let supported = peer.supports_ip;
+                                    let result = peer.ip_write(&value);
+                                    if !supported && peer.supports_ip {
+                                        if let Ok(update) = network.ip.announcement() { let _ = to_peers.send(update); }
+                                    }
+                                    result
+                                } else { Err(anyhow::anyhow!("IP capability before authentication")) };
+                                let response = if result.is_ok() { RequestResponse::Success } else { RequestResponse::UnlikelyError };
+                                let _ = responder.send(WriteRequestResponse { response });
+                                continue;
+                            }
                             if request.service == SERVICE_ID && request.characteristic == BULK_ID {
                                 let result = if offset != 0 || value.is_empty() || value.len() > wire::ATT_CHUNK {
                                     Err(anyhow::anyhow!("invalid bulk capability fragment"))
@@ -464,6 +519,16 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
+        // A legacy link receives no unknown IP payloads. The optional,
+        // encrypted capability upgrades it without resetting the GATT session.
+        let announcement = Update::new(own_id, Kind::IpEndpoint, b"null".to_vec()).unwrap();
+        peer.offer(&announcement).unwrap();
+        assert!(peer.sender.next(Instant::now()).is_none());
+        let packet = session.seal(b"IP01").unwrap();
+        for chunk in wire::frame(&packet).unwrap().chunks(wire::ATT_CHUNK) {
+            peer.ip_write(chunk).unwrap();
+        }
+        assert!(peer.supports_ip);
         let packet = session.seal(&bulk::encode_endpoint(None)).unwrap();
         for chunk in wire::frame(&packet).unwrap().chunks(wire::ATT_CHUNK) {
             peer.bulk_write(&bulk, chunk).unwrap();

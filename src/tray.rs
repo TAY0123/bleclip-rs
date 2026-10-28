@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use std::{sync::Arc, thread, time::Duration};
 use tokio::{runtime::Builder, sync::watch};
 use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
     Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent,
 };
 
@@ -375,6 +375,24 @@ async fn worker(
 pub(crate) fn run(mut config: PeerOptions) -> Result<()> {
     config.sync_files = true;
     let menu = Menu::new();
+    let ip_control = crate::transport::ip::settings::global();
+    let ip_submenu = Submenu::new("IP data exchange", true);
+    let ip_enabled = CheckMenuItem::new(
+        "Enable IP transfers",
+        true,
+        ip_control.snapshot().enabled,
+        None,
+    );
+    let ip_address = MenuItem::new("Receiving IP…", true, None);
+    let ip_port = MenuItem::new("Listening port…", true, None);
+    let ip_status = MenuItem::new("IP listener: initializing", false, None);
+    let open_log = MenuItem::new("Open transfer log", true, None);
+    ip_submenu.append(&ip_enabled)?;
+    ip_submenu.append(&ip_address)?;
+    ip_submenu.append(&ip_port)?;
+    ip_submenu.append(&ip_status)?;
+    ip_submenu.append(&open_log)?;
+
     let connection_item = MenuItem::new("Connection: initializing BLE", false, None);
     let scan_item = MenuItem::new("Discovery: checking every 2 seconds", false, None);
     let peers_submenu = Submenu::new("Connected peers (0)", true);
@@ -397,6 +415,7 @@ pub(crate) fn run(mut config: PeerOptions) -> Result<()> {
     menu.append(&peers_submenu)?;
     menu.append(&transfer_status)?;
     menu.append(&transfers_submenu)?;
+    menu.append(&ip_submenu)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&toggle_menu)?;
     menu.append(&PredefinedMenuItem::separator())?;
@@ -439,6 +458,7 @@ pub(crate) fn run(mut config: PeerOptions) -> Result<()> {
     println!("BLEClip tray: left-click toggles sharing; right-click shows connected peers.");
     let ui_result = (|| -> Result<()> {
         let mut shown: Option<(TrayState, ConnectionSnapshot)> = None;
+        let mut shown_ip = None;
         loop {
             if pump_native_events() || background.is_finished() {
                 break;
@@ -477,12 +497,74 @@ pub(crate) fn run(mut config: PeerOptions) -> Result<()> {
                             }
                         });
                     }
+                } else if &event.id == ip_enabled.id() {
+                    if let Err(error) = ip_control.update(|s| s.enabled = ip_enabled.is_checked()) {
+                        crate::desktop::notify("Cannot change IP settings", &format!("{error:#}"));
+                    }
+                } else if &event.id == ip_address.id() || &event.id == ip_port.id() {
+                    let port = &event.id == ip_port.id();
+                    let control = ip_control.clone();
+                    thread::spawn(move || {
+                        let result = (|| -> Result<()> {
+                            let settings = control.snapshot();
+                            let (prompt, value) = if port {
+                                (
+                                    "Listening TCP port (1–65535, or 0 for automatic):",
+                                    settings.port.to_string(),
+                                )
+                            } else {
+                                ("Local receiving IP address (or Auto):", settings.ip_label())
+                            };
+                            if let Some(value) = crate::desktop::prompt_text(
+                                "BLEClip IP data exchange",
+                                prompt,
+                                &value,
+                            )? {
+                                if port {
+                                    let value = value
+                                        .parse::<u16>()
+                                        .context("enter a port from 0 to 65535")?;
+                                    control.update(|s| s.port = value)?;
+                                } else {
+                                    let value =
+                                        if value.eq_ignore_ascii_case("auto") || value.is_empty() {
+                                            None
+                                        } else {
+                                            Some(value.parse().context(
+                                                "enter a valid local IPv4 or IPv6 address",
+                                            )?)
+                                        };
+                                    control.update(|s| s.receive_ip = value)?;
+                                }
+                            }
+                            Ok(())
+                        })();
+                        if let Err(error) = result {
+                            crate::desktop::notify(
+                                "Cannot change IP settings",
+                                &format!("{error:#}"),
+                            );
+                        }
+                    });
+                } else if &event.id == open_log.id() {
+                    crate::logging::event("Transfer log opened");
+                    if let Err(error) = crate::desktop::open_path(&crate::logging::path()) {
+                        crate::desktop::notify("Cannot open log", &format!("{error:#}"));
+                    }
                 } else if &event.id == quit_menu.id() {
                     should_quit = true;
                 }
             }
             if should_quit {
                 break;
+            }
+            let current_ip = (ip_control.snapshot(), ip_control.status());
+            if shown_ip.as_ref() != Some(&current_ip) {
+                ip_enabled.set_checked(current_ip.0.enabled);
+                ip_address.set_text(format!("Receiving IP: {}…", current_ip.0.ip_label()));
+                ip_port.set_text(format!("Listening port: {}…", current_ip.0.port));
+                ip_status.set_text(&current_ip.1);
+                shown_ip = Some(current_ip);
             }
             let current = (*control_tx.borrow(), snapshots.borrow().clone());
             if shown.as_ref() != Some(&current) {

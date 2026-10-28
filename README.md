@@ -1,10 +1,10 @@
 # BLEClip v0.4.2 — encrypted P2P clipboard mesh with a system tray
 
-BLEClip is a **serverless Bluetooth Low Energy** Rust app (CLI or system tray) that automatically synchronizes **text, clipboard images, and copied files** between multiple trusted Windows/Linux computers. Each node advertises, scans, and can relay an update to other online nodes. BLE advertisements are for discovery only; content travels over mutually authenticated and encrypted GATT connections, with optional LE L2CAP bulk channels between Linux peers.
+BLEClip is a **serverless Bluetooth Low Energy** Rust app (CLI or system tray) that automatically synchronizes **text, clipboard images, and copied files** between multiple trusted Windows/Linux computers. Each node advertises, scans, and can relay an update to other online nodes. BLE advertisements are for discovery only; content travels over mutually authenticated and encrypted GATT connections, with optional LE L2CAP bulk channels between Linux peers and encrypted TCP/IP transfers on Windows and Linux.
 
 > **Experimental / hardware testing needed.** The system tray feature does not replace device-level BLE validation. A successful `cargo test` / `cargo build` does not prove the Bluetooth hardware, Windows GATT peripheral mode, or desktop clipboard integration works. See [SECURITY.md](SECURITY.md).
 
-## Features and hard limits
+## Content support and BLE limits
 
 | Content | Source | Remote action | Maximum per clipboard event |
 | --- | --- | --- | --- |
@@ -15,7 +15,17 @@ BLEClip is a **serverless Bluetooth Low Energy** Rust app (CLI or system tray) t
 
 Text larger than 16 KiB is compressed for transfer. Update all receiving and relay peers to support these transfers and the higher limits; older builds cannot decode compressed text or accept the larger payloads.
 
-Large transfers can take a long time or time out, and each active transfer is buffered in memory.
+Large BLE transfers can take a long time or time out, and each active BLE transfer is buffered in memory. IP file transfers stream to disk.
+
+### Optional IP data exchange (Windows and Linux)
+
+Right-click the tray icon → **IP data exchange** → **Enable IP transfers** on both devices. Set **Receiving IP** to a local interface address, or leave **Auto** to select the default IPv4 route. Set **Listening port** (default **38471**; **0** selects a free port). The menu shows the actual listening address and any listener error. Allow inbound TCP for that port in your firewall and ensure the advertised addresses are reachable between devices.
+
+Text, images, **Send file…**, and file-paste downloads use IP when both peers enable it. File-paste requests carry the receiver's current IP, port, and a request-specific capability over authenticated BLE. Each TCP connection performs a fresh authenticated, encrypted handshake; data uses encrypted 64 KiB chunks and integrity checks. Text above 16 KiB is compressed before sending.
+
+**IP has no configured byte-size cap.** Files stream directly to disk; text and images still require enough memory and clipboard support. The existing limit of 16 regular files per selection and filename checks remain. The limits in the table above apply to BLE. If IP connection, authentication, transfer, or acknowledgement fails, the same event UUID retries over BLE (including L2CAP when available). Items above BLE's limits require a working IP connection; a failed oversized file paste returns an error. Partial file transfers are cleaned up and restart from the beginning.
+
+The **Transfers** menu displays progress and **IP TCP**, **BLE L2CAP**, or **BLE GATT**. **Open transfer log** opens the rotating progress/error log; clipboard contents and capability tokens are excluded. IP settings persist in the platform configuration directory under `bleclip/ip-transfer.json`. Pausing sharing closes the listener and cancels IP transfers. New peers negotiate IP capability without breaking older GATT peers. Streamed file downloads are delivered directly to the recipient rather than relayed as an in-memory mesh bundle.
 
 ### Optional BLE L2CAP bulk transfer
 
@@ -25,9 +35,9 @@ The existing authenticated GATT link exchanges a short-lived capability for the 
 
 If negotiation, connection, authentication, transfer, or acknowledgement fails, the same update is retried over GATT. A failed attempt suppresses further L2CAP attempts on that link for 60 seconds. A partial transfer restarts from the beginning; an update already delivered before its acknowledgement was lost is deduplicated by its UUID. Closing the GATT link, pausing, or quitting revokes its bulk capability and cancels active bulk transfers.
 
-**Windows currently uses GATT**, because the application's Windows backend does not expose LE L2CAP sockets. Older peers and Linux systems without working L2CAP sockets also use GATT. All receiving and relay peers must still support the payload type and size being sent. Use `bleclip peer --no-l2cap ...` or `bleclip tray --no-l2cap ...` to force GATT. No measured throughput guarantee is provided; the automated tests use in-memory streams, and hardware performance needs two-device testing.
+**Windows uses GATT for Bluetooth transfers**, because the application's Windows backend does not expose LE L2CAP sockets. Older peers and Linux systems without working L2CAP sockets also use GATT. All receiving and relay peers must still support the payload type and size being sent. Use `bleclip peer --no-l2cap ...` or `bleclip tray --no-l2cap ...` to force GATT. No measured throughput guarantee is provided; the automated tests use in-memory streams, and hardware performance needs two-device testing.
 
-**Tray mode enables file copy/paste and file receiving by default**, including the Windows double-click launcher. CLI `peer`, `serve`, and `connect` modes require `--sync-files` on nodes that send, receive, or relay files. Images and text are enabled by default; use `--no-images` to turn off image synchronization. Directories, symlinks, folders, virtual clipboard files, huge files, and file lists beyond the limits are not transferred. Original files are never deleted, and received files are never executed.
+**Tray mode enables file copy/paste and file receiving by default**, including the Windows double-click launcher. CLI `peer`, `serve`, and `connect` modes require `--sync-files` on nodes that send, receive, or relay files. Images and text are enabled by default; use `--no-images` to turn off image synchronization. Directories, symlinks, folders, virtual clipboard files, and file lists beyond 16 entries are not transferred. Files above 64 MiB require IP data exchange. Original files are never deleted, and received files are never executed.
 
 ### Download prebuilt binaries (public)
 
@@ -200,17 +210,17 @@ On Linux, `arboard` supports X11 and Wayland data-control when available. Some W
 
 **ACK means the peer reassembled and authenticated the bytes, not that another desktop app has pasted the item.** There is no durable store-and-forward for peers that disconnect, no transfer continuation after reconnect, and no guarantee of exactly-once file placement after process restarts. Relays decrypt and re-encrypt content because all devices with the shared group key are mutually trusted; this is *per-link* encryption, not a zero-knowledge mesh.
 
-**Performance warning:** the GATT fallback uses 20-byte fragments and polled reads and can be extremely slow for megabyte-sized payloads. Linux peers can use the optional LE L2CAP channel described above. Neither path is suitable for multi-gigabyte transfers; a BLE-discovered encrypted LAN or Wi-Fi transport is not implemented.
+**Performance warning:** the GATT fallback uses 20-byte fragments and polled reads and can be extremely slow for megabyte-sized payloads. Linux peers can use the optional LE L2CAP channel described above. For large transfers, enable IP data exchange on both peers over a reachable LAN or Wi-Fi network.
 
 **Protocol breaking change:** v3 uses distinct service UUIDs and crypto handshake labels and is incompatible with v0.2. All computers must upgrade.
 
 ## Security decisions
 
 - File sync is **off by default** to prevent unexpected file disclosure and incoming disk writes.
-- Receivers accept up to 16 regular files with a total payload cap of 64 MiB; filenames are sanitized, cannot contain path traversal, and Windows device names are escaped.
+- Receivers accept up to 16 regular files, with a total payload cap of 64 MiB on BLE and no configured byte cap on IP; filenames are sanitized, cannot contain path traversal, and Windows device names are escaped.
 - Received files are stored in a unique per-event directory, first written to a staging directory, and then atomically renamed on the same filesystem. Existing destination directories are not overwritten; failed staging is removed.
 - Linux staging directories use mode `0700` and files `0600`; other platforms use desktop user filesystem permissions.
-- PNG decoder applies dimensions and memory limits. Unrecognized payloads and corrupt hashes are rejected.
+- The BLE PNG decoder applies dimensions and memory limits; IP images use available system memory. Unrecognized payloads and corrupt hashes are rejected.
 - Every authorized peer can inject clipboard contents or file data. Protect the PSK and do not join untrusted groups.
 
 ## Test commands

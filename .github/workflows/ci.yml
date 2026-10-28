@@ -37,7 +37,7 @@ jobs:
         run: cargo test --locked --all-targets
       - name: Test delayed file paste on isolated X11
         if: runner.os == 'Linux'
-        run: env -u WAYLAND_DISPLAY xvfb-run -a cargo test --locked native_file_paste_fetches_once_after_metadata_offer -- --ignored
+        run: env -u WAYLAND_DISPLAY xvfb-run -a cargo test --locked native_file_paste_ -- --ignored --test-threads=1
       - name: Verify tray subcommand
         run: cargo run --locked -- tray --help
       - name: Compile release binary

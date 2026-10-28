@@ -60,30 +60,35 @@ pub struct Initiator {
 enum Domain {
     Gatt,
     L2cap,
+    Ip,
 }
 impl Domain {
     fn client(self) -> &'static [u8] {
         match self {
             Self::Gatt => b"bleclip/v3/client",
             Self::L2cap => b"bleclip/l2cap/v1/client",
+            Self::Ip => b"bleclip/ip/v1/client",
         }
     }
     fn server(self) -> &'static [u8] {
         match self {
             Self::Gatt => b"bleclip/v3/server",
             Self::L2cap => b"bleclip/l2cap/v1/server",
+            Self::Ip => b"bleclip/ip/v1/server",
         }
     }
     fn finish(self) -> &'static [u8] {
         match self {
             Self::Gatt => b"bleclip/v3/finish",
             Self::L2cap => b"bleclip/l2cap/v1/finish",
+            Self::Ip => b"bleclip/ip/v1/finish",
         }
     }
     fn salt(self) -> &'static [u8] {
         match self {
             Self::Gatt => b"bleclip/v3/salt",
             Self::L2cap => b"bleclip/l2cap/v1/salt",
+            Self::Ip => b"bleclip/ip/v1/salt",
         }
     }
 }
@@ -94,6 +99,9 @@ impl Initiator {
     }
     pub fn start_l2cap(psk: &Psk) -> (Self, Vec<u8>) {
         Self::start_in(psk, Domain::L2cap)
+    }
+    pub fn start_ip(psk: &Psk) -> (Self, Vec<u8>) {
+        Self::start_in(psk, Domain::Ip)
     }
     fn start_in(psk: &Psk, domain: Domain) -> (Self, Vec<u8>) {
         let secret = EphemeralSecret::random_from_rng(OsRng);
@@ -160,6 +168,9 @@ impl PendingServer {
 
 pub fn accept(psk: &Psk, hello: &[u8]) -> Result<(PendingServer, Vec<u8>)> {
     accept_in(psk, hello, Domain::Gatt)
+}
+pub fn accept_ip(psk: &Psk, hello: &[u8]) -> Result<(PendingServer, Vec<u8>)> {
+    accept_in(psk, hello, Domain::Ip)
 }
 #[cfg(any(target_os = "linux", test))]
 pub fn accept_l2cap(psk: &Psk, hello: &[u8]) -> Result<(PendingServer, Vec<u8>)> {
@@ -248,10 +259,10 @@ pub struct Session {
 impl Session {
     /// Encrypt a typed binary application payload (identity or clipboard update).
     pub fn seal(&self, payload: &[u8]) -> Result<Vec<u8>> {
-        ensure!(
-            payload.len() + 1 + 24 + 16 <= MAX_FRAME,
-            "payload too large"
-        );
+        self.seal_limited(payload, MAX_FRAME)
+    }
+    pub(crate) fn seal_limited(&self, payload: &[u8], limit: usize) -> Result<Vec<u8>> {
+        ensure!(payload.len() + 1 + 24 + 16 <= limit, "payload too large");
         let mut nonce = [0u8; 24];
         OsRng.fill_bytes(&mut nonce);
         let encrypted = self
@@ -272,12 +283,15 @@ impl Session {
     }
 
     pub fn open(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
+        self.open_limited(packet, MAX_FRAME)
+    }
+    pub(crate) fn open_limited(&mut self, packet: &[u8], limit: usize) -> Result<Vec<u8>> {
         ensure!(
             packet.len() >= 1 + 24 + 16 && packet[0] == ENCRYPTED,
             "invalid encrypted protocol packet"
         );
         ensure!(
-            packet.len() <= MAX_FRAME,
+            packet.len() <= limit,
             "encrypted payload exceeds size limit"
         );
         let nonce: [u8; 24] = packet[1..25].try_into()?;
@@ -311,6 +325,11 @@ mod tests {
         let psk = [17; 32];
         let (_, gatt) = Initiator::start(&psk);
         let (_, l2cap) = Initiator::start_l2cap(&psk);
+        let (_, ip) = Initiator::start_ip(&psk);
+        assert!(accept(&psk, &ip).is_err());
+        assert!(accept_l2cap(&psk, &ip).is_err());
+        assert!(accept_ip(&psk, &gatt).is_err());
+        assert!(accept_ip(&psk, &l2cap).is_err());
         assert!(accept_l2cap(&psk, &gatt).is_err());
         assert!(accept(&psk, &l2cap).is_err());
     }
